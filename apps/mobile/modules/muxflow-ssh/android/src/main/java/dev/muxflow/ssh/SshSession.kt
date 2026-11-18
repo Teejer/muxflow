@@ -22,9 +22,13 @@ import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.verification.HostKeyVerifier
 import net.schmizz.sshj.userauth.UserAuthException
 import net.schmizz.sshj.userauth.keyprovider.KeyPairWrapper
+import net.schmizz.sshj.userauth.method.AuthKeyboardInteractive
 import net.schmizz.sshj.userauth.method.AuthMethod
 import net.schmizz.sshj.userauth.method.AuthNone
 import net.schmizz.sshj.userauth.method.AuthPublickey
+import net.schmizz.sshj.userauth.method.ChallengeResponseProvider
+import net.schmizz.sshj.userauth.password.Resource
+import org.slf4j.LoggerFactory
 
 /** The exact close reason strings the TypeScript facade accepts (design doc §6.1). */
 internal object CloseReason {
@@ -219,10 +223,17 @@ internal class SshTransport(
    * authenticated the phone by its tailnet identity and accepts it outright, so a tailnet host
    * needs no key on the phone at all. A regular sshd answers `none` with the methods it does
    * accept, and sshj only moves on to `publickey` when the server listed it.
+   *
+   * `keyboard-interactive` trails the key so a two-factor host can complete: with
+   * `AuthenticationMethods publickey,keyboard-interactive` the key yields a partial success and the
+   * second factor arrives as info requests on this method. [EmptyChallengeResponder] answers them
+   * the way Enter at the prompt answers them in OpenSSH, which carries Duo push mode. sshj only
+   * reaches the method when the server named it, so single-factor hosts never send a challenge.
    */
   private fun authMethods(): List<AuthMethod> {
     val methods = mutableListOf<AuthMethod>(AuthNone())
     keyPair?.let { methods.add(AuthPublickey(KeyPairWrapper(it))) }
+    methods.add(AuthKeyboardInteractive(EmptyChallengeResponder))
     return methods
   }
 
@@ -283,6 +294,36 @@ internal class SshTransport(
 /** Carries the close reason a failed transport setup should report to its waiting channel. */
 private class TransportSetupException(val reason: String, cause: Throwable?) :
   IOException("SSH transport setup failed: $reason", cause)
+
+/**
+ * Answers every `keyboard-interactive` info request with an empty response.
+ *
+ * This is the shape a Duo push-mode host expects: the key authenticates first, sshd then relays the
+ * Duo prompts, and an empty answer means "go ahead" exactly as pressing Enter does in the OpenSSH
+ * client, because the real approval happens out of band in Duo Mobile. A host that instead expects a
+ * typed secret receives an empty one and refuses, closing `authFailed` like any rejected key: the
+ * responder never guesses, never retries, and never answers twice in one request.
+ *
+ * The prompts are logged so a connection failure against a new two-factor layout is diagnosable from
+ * a logcat capture without guessing which method stalled.
+ */
+internal object EmptyChallengeResponder : ChallengeResponseProvider {
+  private val logger = LoggerFactory.getLogger(EmptyChallengeResponder::class.java)
+
+  /** No submethod preference, the same empty list the OpenSSH client sends. */
+  override fun getSubmethods(): List<String> = emptyList()
+
+  override fun init(resource: Resource<*>?, name: String?, instruction: String?) {
+    logger.info("keyboard-interactive begins: name={} instruction={}", name, instruction)
+  }
+
+  override fun getResponse(prompt: String, echo: Boolean): CharArray {
+    logger.info("answering keyboard-interactive challenge empty: {}", prompt)
+    return CharArray(0)
+  }
+
+  override fun shouldRetry(): Boolean = false
+}
 
 /**
  * One remote command on one exec channel of an [SshTransport], with its own IO thread.

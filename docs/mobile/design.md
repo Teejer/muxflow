@@ -75,7 +75,7 @@ That is the whole product for v1.
 | D6 | Opening a phone or desktop terminal claims sizing for its exact tmux window; the latest client claim wins. When the app becomes inactive or the terminal screen closes, it sends `YIELD_TERMINAL_SIZING`; the host puts that control client in `ignore-size` while keeping the SSH connection and notifications alive. Returning to the terminal claims that window again, even at unchanged dimensions. The desktop retains its existing resize behavior on input and layout changes. | A phone in a pocket cannot keep a desktop window at phone width when the desktop switches tabs. The phone regains its size when the user returns to it. |
 | D6b | The terminal is the control plane, for v1 and beyond. No transcript parsing, screen scraping, or keystroke choreography behind buttons. A future read-only "Conversation" view (for voice or skimming) would tail the agents' own transcript files through the file service — reading, never controlling. | Earlier agent tools ended up with the terminal as the default and tens of thousands of lines of fragile per-vendor keystroke logic around their structured views. |
 | D7 | Attention state (`seen_generation`) is shared with the desktop through the host. Opening an agent on the phone clears its badge on the desktop and vice-versa. | It is free: the host already owns this state. |
-| D8 | Offer SSH `none` first, then Ed25519 public-key authentication if a key exists. Store keys natively in Android-encrypted storage or iOS Keychain. Host-key trust uses fingerprint confirmation on both platforms. | Tailscale SSH works without a phone key; ordinary SSH uses keys. No password authentication. |
+| D8 | Offer SSH `none` first, then Ed25519 public-key authentication if a key exists, then answer `keyboard-interactive` challenges with empty responses so two-factor push hosts (Duo push mode) complete after the key. The Android sshj transport implements this; the iOS libssh2 transport is a tracked follow-up. Store keys natively in Android-encrypted storage or iOS Keychain. Host-key trust uses fingerprint confirmation on both platforms. | Tailscale SSH works without a phone key; ordinary SSH uses keys. No password authentication, and the empty answer never guesses a typed secret. |
 | D9 | Android uses a foreground service with a persistent connection notification. Initial iOS support tears down and reconnects on foreground; background APNs alerts are a separate milestone. | iOS suspension cannot be bypassed with Android's service/timer design. See `ios-plan.md` for lifecycle and foreground notification policy. |
 | D10 | Package/app id: `dev.muxflow.mobile`. App display name: `Muxflow`. Source lives in this repository under `apps/mobile`. | One repo, one `.proto`, one release process. |
 
@@ -297,12 +297,19 @@ export interface MuxflowSsh {
      (or 60 s pass → reject, close with reason `"hostKeyNotTrusted"`).
      When non-null and different, reject immediately and close with
      reason `"hostKeyMismatch"`.
-  3. Authenticates with `auth(user, [none, publickey])` — the OpenSSH
+  3. Authenticates with `auth(user, [none, publickey, keyboard-interactive])` — the OpenSSH
      client's order. `none` first: a Tailscale SSH host has already
      authenticated the phone by its tailnet identity and accepts it, so no
      key on the phone is required (Termux-style `ssh host` just works). A
      regular sshd answers `none` with its accepted methods and sshj moves on
-     to `publickey` with the stored key, if any. Failure → close with
+     to `publickey` with the stored key, if any. A two-factor host
+     (`AuthenticationMethods publickey,keyboard-interactive`) answers the key
+     with a partial success and sends the second factor as info requests on
+     `keyboard-interactive`; the phone answers every challenge with an empty
+     response, which is what pressing Enter at a Duo push-mode prompt does in
+     the OpenSSH client, and the real approval happens out of band in Duo
+     Mobile. A host that expects a typed secret gets an empty one and
+     refuses, the same close as any rejected key. Failure → close with
      reason `"authFailed"`. Tailscale check mode delivers its sign-in URL as
      an auth banner and holds the login open until approved; v1 does not
      surface the banner.

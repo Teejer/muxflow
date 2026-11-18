@@ -101,6 +101,22 @@ is unaffected.
   is also an SSH host shares one helper between both, and only when both are
   the same Muxflow version. Update both machines to the same release.
 
+# A host that requires two factors
+
+A host configured with `AuthenticationMethods publickey,keyboard-interactive`
+(the usual shape for Duo, and for other second factors wired through PAM)
+authenticates the phone's key first and then delivers the second factor as
+`keyboard-interactive` challenges. The phone answers each challenge with an
+empty response, which is what pressing Enter does in the OpenSSH client: a
+push-based factor such as Duo push mode then completes while you approve in the
+authenticator app. Typed second factors are not supported: a host that expects
+a passcode or password in the challenge receives an empty answer and refuses,
+closing with the same rejected-login error as a wrong key. If a two-factor host
+rejects the phone even though the key is in `~/.ssh/authorized_keys`, check
+that the host actually lists `keyboard-interactive` after a key success
+(`ssh -v` shows `Authentications that can continue:`), and capture a logcat
+filtered on `EmptyChallengeResponder` to see which prompts arrived.
+
 # macOS package and permissions
 
 The macOS build is ad-hoc signed and not notarized, so Gatekeeper blocks a
