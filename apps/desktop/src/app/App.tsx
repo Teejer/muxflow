@@ -1673,6 +1673,7 @@ export function App() {
       update={availableUpdate ?? undefined}
       tabs={tabsInTitleBar ? tabStrip : undefined}
       windowControls={windowControls}
+      windowButtonsSide={appState.shell.windowButtonsSide}
       workspaceName={activeSession?.name}
     />
     <div className="shell-body">

@@ -365,6 +365,14 @@ describe("reading state the previous build wrote", () => {
     expect(saved({}).shell.uiScale).toBe(1);
   });
 
+  it("restores the window buttons' side and leaves saves without it on the macOS end", () => {
+    expect(saved({ windowButtonsSide: "left" }).shell.windowButtonsSide).toBe("left");
+    expect(saved({ windowButtonsSide: "right" }).shell.windowButtonsSide).toBe("right");
+    // Any other value is one this build refuses to trust.
+    expect(saved({ windowButtonsSide: "middle" }).shell.windowButtonsSide).toBe("left");
+    expect(saved({}).shell.windowButtonsSide).toBe("left");
+  });
+
   it("turns on Automations and the assistant for saves without an extension list, and keeps an explicit empty one", () => {
     expect(saved({}).shell.enabledPanelExtensions).toEqual(["automations", "ai"]);
     expect(saved({ enabledPanelExtensions: [] }).shell.enabledPanelExtensions).toEqual([]);
