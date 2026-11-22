@@ -220,7 +220,7 @@ version-dependent branches.
 ### Release skew and admission policy
 
 Today `validateHostContract` checks only the envelope's `protocolMajor`
-(currently 4). `HostConnection.onHelloFrame` logs `helperVersion` and the build
+(currently 5). `HostConnection.onHelloFrame` logs `helperVersion` and the build
 digest but does not compare either with the app version. A newer helper with
 the same major is admitted; a different major becomes a terminal
 `incompatible` state. The host also refuses a different client major.
@@ -549,7 +549,7 @@ GitHub Actions build path.
 - [Mobile contract validation](../../apps/mobile/src/protocol/contract.ts),
   [mobile handshake](../../apps/mobile/src/protocol/HostConnection.ts), and
   [shared Rust contract](../../crates/protocol/src/lib.rs).
-- [Desktop helper artifact comparison](../../apps/desktop/src-tauri/src/connection/helper.rs).
+- [Desktop helper artifact comparison](../../crates/desktop-core/src/connection/helper.rs).
 - [Shared terminal interactions](../../packages/terminal-interactions).
 - [Current CI](../../.github/workflows/ci.yml) and
   [release workflow](../../.github/workflows/release.yml).

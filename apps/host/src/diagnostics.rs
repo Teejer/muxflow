@@ -804,6 +804,26 @@ fn bounded_log_text(text: &str) -> String {
 /// no path, hostname, session name or payload byte is in this line — it stays
 /// inside the privacy declaration above.
 pub fn write_bridge_exit_log(runtime: Option<&Path>, reason: &str, lifetime: Duration) {
+    append_bridge_log(
+        runtime,
+        &bridge_exit_line(now_epoch_millis(), reason, lifetime),
+    );
+}
+
+/// Names a bridge retiring the daemon it found, in `bridge.log` beside its
+/// exit line. A retired daemon is stopped, or sent SIGTERM when it does not
+/// cooperate, and nothing else records that a bridge did it: a daemon killed
+/// for answering slowly could not be told apart from one that crashed.
+/// `reason` is a fixed label (`different-build` or `silent`); see
+/// `write_bridge_exit_log` for why nothing else may be in the line.
+pub fn write_bridge_retired_daemon_log(runtime: Option<&Path>, reason: &str) {
+    append_bridge_log(
+        runtime,
+        &bridge_retired_daemon_line(now_epoch_millis(), reason),
+    );
+}
+
+fn append_bridge_log(runtime: Option<&Path>, line: &str) {
     let Some(runtime) = runtime else { return };
     let path = runtime.join("bridge.log");
     let oversized = fs::symlink_metadata(&path)
@@ -824,11 +844,7 @@ pub fn write_bridge_exit_log(runtime: Option<&Path>, reason: &str, lifetime: Dur
         options.append(true);
     }
     if let Ok(mut file) = options.open(&path) {
-        let _ = writeln!(
-            file,
-            "{}",
-            bridge_exit_line(now_epoch_millis(), reason, lifetime)
-        );
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -846,6 +862,17 @@ fn bridge_exit_line(at_unix_millis: i64, reason: &str, lifetime: Duration) -> St
         "event": "bridgeExit",
         "reason": reason,
         "lifetimeMs": whole_millis(lifetime),
+    })
+    .to_string()
+}
+
+/// Composed apart from the write so the exact line can be pinned by a test.
+fn bridge_retired_daemon_line(at_unix_millis: i64, reason: &str) -> String {
+    serde_json::json!({
+        "atUnixMillis": at_unix_millis,
+        "subsystem": "host_bridge",
+        "event": "daemonRetired",
+        "reason": reason,
     })
     .to_string()
 }
@@ -1000,7 +1027,7 @@ fn codex_hook_superseded_line(
 // runtime directory (`/tmp/muxflow-<uid>/timing.log`). Nothing reads it but a
 // human with `jq`, and nothing in the daemon branches on it.
 //
-// Compile-out scheme, mirroring `apps/desktop/src-tauri/src/perf_log.rs`: the
+// Compile-out scheme, mirroring `crates/desktop-core/src/perf_log.rs`: the
 // real implementation is compiled whenever `debug_assertions` is on (plain
 // `cargo build` / `cargo test`) or the non-default `perf-log` cargo feature is
 // enabled. A plain release build therefore carries only the inert stubs below,
@@ -3011,6 +3038,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Key order is not part of these lines, and a workspace build can turn on
+    /// `serde_json/preserve_order` through another crate.
+    fn assert_same_json(actual: impl AsRef<str>, expected: &str) {
+        let parse = |line: &str| serde_json::from_str::<serde_json::Value>(line).unwrap();
+        assert_eq!(parse(actual.as_ref()), parse(expected));
+    }
+
     #[test]
     fn safe_log_has_only_a_fixed_class_and_never_raw_detail() {
         let serialized = serde_json::json!({
@@ -3028,9 +3062,9 @@ mod tests {
         ] {
             assert!(!serialized.contains(private));
         }
-        assert_eq!(
+        assert_same_json(
             serialized,
-            r#"{"errorClass":"host_connection_ended","subsystem":"host_daemon"}"#
+            r#"{"errorClass":"host_connection_ended","subsystem":"host_daemon"}"#,
         );
     }
 
@@ -3050,9 +3084,18 @@ mod tests {
         ] {
             assert!(!serialized.contains(private));
         }
-        assert_eq!(
+        assert_same_json(
             serialized,
-            r#"{"atUnixMillis":1700000000000,"event":"bridgeExit","lifetimeMs":42,"reason":"daemon-eof","subsystem":"host_bridge"}"#
+            r#"{"atUnixMillis":1700000000000,"event":"bridgeExit","lifetimeMs":42,"reason":"daemon-eof","subsystem":"host_bridge"}"#,
+        );
+    }
+
+    /// Pinned exactly, for the same reason as the exit line beside it.
+    #[test]
+    fn the_bridge_retired_daemon_line_carries_only_a_fixed_reason() {
+        assert_same_json(
+            bridge_retired_daemon_line(1_700_000_000_000, "silent"),
+            r#"{"atUnixMillis":1700000000000,"event":"daemonRetired","reason":"silent","subsystem":"host_bridge"}"#,
         );
     }
 
@@ -3078,9 +3121,9 @@ mod tests {
         ] {
             assert!(!serialized.contains(private));
         }
-        assert_eq!(
+        assert_same_json(
             serialized,
-            r#"{"atUnixMillis":1700000000000,"event":"connectionEnded","lifetimeMs":9000,"msSinceLastClientFrame":120,"msSinceLastHostFrame":7,"reason":"writer-deadline","subsystem":"host_daemon"}"#
+            r#"{"atUnixMillis":1700000000000,"event":"connectionEnded","lifetimeMs":9000,"msSinceLastClientFrame":120,"msSinceLastHostFrame":7,"reason":"writer-deadline","subsystem":"host_daemon"}"#,
         );
     }
 
@@ -3101,9 +3144,9 @@ mod tests {
         ] {
             assert!(!serialized.contains(private));
         }
-        assert_eq!(
+        assert_same_json(
             serialized,
-            r#"{"event":"codexHookSuperseded","hookEvent":"SessionEnd","incomingAgentId":"codex:incominghash","ownerAgentId":"codex:ownerhash","paneId":"%7","subsystem":"host_daemon"}"#
+            r#"{"event":"codexHookSuperseded","hookEvent":"SessionEnd","incomingAgentId":"codex:incominghash","ownerAgentId":"codex:ownerhash","paneId":"%7","subsystem":"host_daemon"}"#,
         );
         let unknown = codex_hook_superseded_line(
             "%7",

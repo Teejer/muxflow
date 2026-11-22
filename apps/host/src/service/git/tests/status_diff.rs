@@ -182,8 +182,11 @@ async fn diff_preserves_crlf_missing_eof_binary_and_symlink_target() {
     let text = service.diff_only(&request, None).await.unwrap();
     assert_eq!(text.old_content, b"one\r\ntwo");
     assert_eq!(text.new_content, b"one\r\nchanged");
-    // The client response carries content, not the patch the editor never read.
-    assert!(text.patch.is_empty());
+    // The client response carries the patch its hunks are drawn from.
+    assert_eq!(
+        text.patch,
+        service.diff_with_patch(&request).await.unwrap().patch
+    );
     let marker = b"\\ No newline at end of file";
     assert!(
         service
@@ -479,6 +482,18 @@ async fn descriptor_pinned_untracked_diff_generates_an_applicable_repo_relative_
             .iter()
             .any(|entry| { entry.path == raw && entry.index_status == "A" })
     );
+    // The file's text, not the name of the descriptor Git was handed.
+    let mut spec = b":0:".to_vec();
+    spec.extend_from_slice(&raw);
+    let blob = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&fixture.root)
+        .arg("cat-file")
+        .arg("blob")
+        .arg(std::ffi::OsString::from_vec(spec))
+        .output()
+        .unwrap();
+    assert_eq!(blob.stdout, b"first\nsecond\n");
 }
 
 #[tokio::test]

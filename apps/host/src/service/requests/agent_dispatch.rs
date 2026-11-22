@@ -10,41 +10,68 @@ use super::super::{
     SequencerControl,
     agents::{
         AgentRuntime, HookIngestFailure, HookManager,
-        adapters::{AgentAdapter, LaunchSpec},
+        adapters::{AgentAdapter, LaunchSpec, fork_name},
         publish,
     },
     filesystem::validate_root_token,
+    history::{History, tab_title},
     snapshot::{server_identity, tmux_command},
+    tmux_actions::escaped_format_literal,
+    tmux_config::NAME_LOCK_OPTION,
 };
 use super::{response_error, send_response};
 
 // tmux normalizes literal control characters in `-F` strings to `_`, so tabs
 // cannot delimit placement IDs portably. Exact tmux IDs contain only their
 // sigil and decimal digits, making `:` an unambiguous cross-version separator.
-const PLACEMENT_FORMAT: &str = "#{session_id}:#{window_id}:#{pane_id}";
+pub(super) const PLACEMENT_FORMAT: &str = "#{session_id}:#{window_id}:#{pane_id}";
+
+/// Stands in, in tests, for agent work stuck on the disk: a request whose agent
+/// ID is [`TEST_AGENT_WORK`] never reaches the process-wide agent runtime, its
+/// state folder or tmux. A hook ingest waits for [`TEST_AGENT_WORK_GATE`] where
+/// a real one would wait for its locks and the disk; anything else answers at
+/// once.
+#[cfg(test)]
+pub(in crate::service) const TEST_AGENT_WORK: &str = "test-agent-work";
+#[cfg(test)]
+pub(in crate::service) static TEST_AGENT_WORK_GATE: Mutex<()> = Mutex::new(());
+/// How many stand-in hook ingests have reached the gate.
+#[cfg(test)]
+pub(in crate::service) static TEST_AGENT_WORK_WAITING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) async fn handle(
     request_id: u64,
     operation: v1::Operation,
     request: v1::Request,
     control_tx: &tokio::sync::mpsc::Sender<SequencerControl>,
-    generation: &Arc<AtomicU64>,
-    topology_baseline: &Arc<Mutex<Option<(tmux_control::TmuxSnapshot, String)>>>,
-    cancellation: &AtomicBool,
+    generation: Arc<AtomicU64>,
+    topology_baseline: Arc<Mutex<Option<(tmux_control::TmuxSnapshot, String)>>>,
+    cancellation: Arc<AtomicBool>,
 ) {
-    let result = handle_inner(
-        operation,
-        request.agent.context("agent request payload is required"),
-        generation,
-        topology_baseline,
-        cancellation,
-    );
-    send_response(
-        control_tx,
-        request_id,
-        result.unwrap_or_else(|error| response_error("agent_request_failed", &error.to_string())),
-    )
+    // Every agent operation is synchronous: it takes the agent runtime's
+    // mutexes, runs tmux, and writes the state file while holding
+    // them. On a runtime worker a stalled disk parks the worker, and enough
+    // waiting hooks park all of them, so the daemon stops accepting and
+    // answering handshakes. On the blocking pool only that pool's threads wait,
+    // and the ordered lane awaits a join handle that its time bound can cut.
+    let agent = request.agent;
+    let result = tokio::task::spawn_blocking(move || {
+        handle_inner(
+            operation,
+            agent.context("agent request payload is required"),
+            &generation,
+            &topology_baseline,
+            &cancellation,
+        )
+    })
     .await;
+    let response = match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => response_error("agent_request_failed", &error.to_string()),
+        Err(_) => response_error("agent_request_failed", "agent request task failed"),
+    };
+    send_response(control_tx, request_id, response).await;
 }
 
 fn handle_inner(
@@ -58,6 +85,17 @@ fn handle_inner(
         bail!("agent request was cancelled");
     }
     let request = request?;
+    #[cfg(test)]
+    if request.agent_id == TEST_AGENT_WORK {
+        if operation == v1::Operation::AgentHookIngest {
+            TEST_AGENT_WORK_WAITING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            drop(TEST_AGENT_WORK_GATE.lock());
+        }
+        return Ok(v1::Response {
+            ok: true,
+            ..Default::default()
+        });
+    }
     let runtime = AgentRuntime::global();
     let mut response = v1::AgentResponse::default();
     let mut diagnostic_lines = Vec::new();
@@ -254,7 +292,7 @@ fn launch_agent(
     let adapter = super::super::agents::adapters::by_id(&request.adapter_id)
         .context("supported agent adapter is required")?;
     let placement = placement_for(request, action)?;
-    let (root, source_title) = {
+    let (root, source_title, fork_tab_name) = {
         let baseline = topology_baseline.lock().unwrap();
         let (snapshot, baseline_identity) = baseline
             .as_ref()
@@ -265,20 +303,32 @@ fn launch_agent(
         validate_placement_target(request, placement, snapshot)?;
         if branch {
             let source = branch_source(request, snapshot)?;
+            let window_name = snapshot
+                .windows
+                .iter()
+                .find(|window| window.id == source.window_id)
+                .map_or("", |window| window.name.as_str());
             // A tab with a locked name publishes no pane title: that name is
             // the one its agent goes by.
             let title = if source.title.is_empty() {
-                snapshot
-                    .windows
-                    .iter()
-                    .find(|window| window.id == source.window_id)
-                    .map_or("", |window| window.name.as_str())
+                window_name
             } else {
                 source.title.as_str()
             };
-            (source.current_path.clone(), title.to_owned())
+            // The copy's tab says what it is a copy of, as its row does.
+            let shown = tab_title(&source.title, window_name);
+            let fork_tab_name = fork_name(if shown.is_empty() {
+                adapter.display_name()
+            } else {
+                &shown
+            });
+            (
+                source.current_path.clone(),
+                title.to_owned(),
+                Some(fork_tab_name),
+            )
         } else {
-            (request.active_root.clone(), String::new())
+            (request.active_root.clone(), String::new(), None)
         }
     };
     let launch_argv = agent_launch_argv(launch_spec(
@@ -319,10 +369,43 @@ fn launch_agent(
     let stdout =
         String::from_utf8(output.stdout).context("tmux returned non-UTF-8 placement IDs")?;
     let ids = parse_placement_ids(&stdout)?;
+    if let Some(name) = fork_tab_name {
+        if split {
+            // A fork in a split is a side question (`/btw`, `/side`), which
+            // History leaves out. Its tab is the source's, so it keeps its name.
+            History::global().hide_pane(&ids.2);
+        } else {
+            name_fork_tab(&ids.1, &name);
+        }
+    }
     // Invalidate the cached topology. The topology actor will publish the
     // authoritative post-launch snapshot and process detection result.
     *topology_baseline.lock().unwrap() = None;
     Ok(ids)
+}
+
+/// Names a branch's tab `<name> (fork)` and locks it, as a rename from the
+/// tab menu does, so the agent's own title cannot take it back and History
+/// knows the copy for a fork. A tab left unnamed is not worth failing a
+/// branch that already opened.
+fn name_fork_tab(window_id: &str, name: &str) {
+    let Ok(mut command) = tmux_command() else {
+        return;
+    };
+    command.args([
+        "set-option",
+        "-w",
+        "-t",
+        window_id,
+        NAME_LOCK_OPTION,
+        "1",
+        ";",
+        "rename-window",
+        "-t",
+        window_id,
+        &escaped_format_literal(name),
+    ]);
+    let _ = command.output();
 }
 
 fn launch_spec(
@@ -340,7 +423,7 @@ fn launch_spec(
     }
 }
 
-fn parse_placement_ids(stdout: &str) -> anyhow::Result<(String, String, String)> {
+pub(super) fn parse_placement_ids(stdout: &str) -> anyhow::Result<(String, String, String)> {
     let ids = stdout.trim_end().split(':').collect::<Vec<_>>();
     if ids.len() != 3 {
         bail!("tmux omitted launch placement identity");
@@ -425,7 +508,7 @@ fn validate_tmux_id(value: &str, prefix: char) -> anyhow::Result<()> {
     }
 }
 
-/// Runs the agent inside the user's interactive shell, the way a tab's shell
+/// Runs the agent inside the user's interactive login shell, the way a tab's shell
 /// starts. The daemon and the tmux server can hold a bare system `PATH`
 /// (`/usr/bin:/bin`) while the CLIs live in `~/.local/bin` or a node manager,
 /// which only the shell's startup files add. A bare `exec claude` there exits
@@ -434,7 +517,7 @@ fn validate_tmux_id(value: &str, prefix: char) -> anyhow::Result<()> {
 /// `/bin/sh` is named here because tmux would otherwise hand one string to the
 /// user's own shell, and not every shell can parse `${SHELL:-...}`. Separate
 /// arguments make tmux run it directly.
-fn agent_launch_argv(launch: LaunchSpec) -> [String; 3] {
+pub(super) fn agent_launch_argv(launch: LaunchSpec) -> [String; 3] {
     let agent_command = std::iter::once(launch.program.to_owned())
         .chain(launch.arguments)
         .map(|argument| shell_quote(&argument))
@@ -444,7 +527,7 @@ fn agent_launch_argv(launch: LaunchSpec) -> [String; 3] {
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         format!(
-            "exec \"${{SHELL:-/bin/sh}}\" -ic {}",
+            "exec \"${{SHELL:-/bin/sh}}\" -lic {}",
             shell_quote(&format!("exec {agent_command}"))
         ),
     ]
@@ -471,12 +554,14 @@ mod tests {
             program: "printf",
             arguments: vec!["%s|".into(), "a b".into(), "it's $(nope)".into()],
         });
-        assert!(command.starts_with("exec \"${SHELL:-/bin/sh}\" -ic "));
+        assert!(command.starts_with("exec \"${SHELL:-/bin/sh}\" -lic "));
         assert_eq!((shell.as_str(), flag.as_str()), ("/bin/sh", "-c"));
+        let home = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(shell)
             .arg(flag)
             .arg(&command)
             .env("SHELL", "/bin/sh")
+            .env("HOME", home.path())
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -485,7 +570,7 @@ mod tests {
     }
 
     /// A tmux server started outside a login holds a bare system `PATH`, and
-    /// the agent's directory is only added by the shell's startup file.
+    /// the agent's directory is only added by the login profile, not bashrc.
     #[test]
     fn launched_agent_is_found_on_the_path_the_shell_startup_adds() {
         use std::os::unix::fs::PermissionsExt;
@@ -497,19 +582,31 @@ mod tests {
         std::fs::write(&agent, "#!/bin/sh\n: > \"$HOME/launched\"\n").unwrap();
         std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(
-            home.path().join(".bashrc"),
+            home.path().join(".bash_profile"),
             "export PATH=\"$HOME/bin:$PATH\"\n",
         )
         .unwrap();
 
-        let socket = format!("ade-agent-launch-test-{}", std::process::id());
+        struct Server(std::path::PathBuf);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .arg("-S")
+                    .arg(&self.0)
+                    .arg("kill-server")
+                    .output();
+            }
+        }
+        let server = Server(home.path().join("tmux.sock"));
         let tmux = || {
             let mut command = std::process::Command::new("tmux");
             command
                 .env_remove("TMUX")
                 .env("HOME", home.path())
                 .env("SHELL", "/bin/bash")
-                .args(["-L", &socket, "-f", "/dev/null"]);
+                .arg("-S")
+                .arg(&server.0)
+                .args(["-f", "/dev/null"]);
             command
         };
         let started = tmux()
@@ -527,7 +624,6 @@ mod tests {
         while !launched.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = tmux().arg("kill-server").output();
         assert!(launched.exists(), "the agent never started");
     }
 
@@ -678,6 +774,7 @@ mod tests {
                 pane_pid: 0,
                 start_command: String::new(),
                 title: String::new(),
+                chat_adapter_id: String::new(),
             }],
             ..Default::default()
         }

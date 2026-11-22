@@ -1,0 +1,1943 @@
+//! Ported from `api.test.ts`, `repositoryStore.test.ts`, `GitSidebar.test.tsx`,
+//! `GitDiffSurface.test.tsx`, `useWorkspaceGit.test.tsx` and the Git half of
+//! `useWorkspaceDomainController.test.ts`.
+
+use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+use desktop_core::{
+    app_state::{AppTabKind, AppTabRecord, PersistedAppState},
+    connection::{git::GitCommand, git_content::GitDiffContentCommand},
+    platform::EventSink,
+};
+use futures::{FutureExt, channel::oneshot, future::BoxFuture};
+use gpui_kit::{AppContext as _, Entity, TestAppContext};
+use serde_json::{Value, json};
+
+use super::{
+    client::{self, GitTransport, Transport},
+    diff_view::GitDiffView,
+    model::{self, *},
+    panel::{GitPanel, PanelContext, PanelEvent, Work},
+    store::GitRepositories,
+};
+
+// A host that answers what a test tells it to, and remembers what it was asked.
+
+type Answer = Box<dyn FnMut(&GitCommand) -> Option<Result<Value, String>>>;
+type Held = Vec<(GitCommand, oneshot::Sender<Result<Value, String>>)>;
+
+struct Fake {
+    requests: RefCell<Vec<GitCommand>>,
+    held: RefCell<Held>,
+    cancelled: RefCell<Vec<String>>,
+    answer: RefCell<Answer>,
+}
+
+impl Fake {
+    fn new(answer: impl FnMut(&GitCommand) -> Option<Result<Value, String>> + 'static) -> Rc<Self> {
+        Rc::new(Self {
+            requests: RefCell::default(),
+            held: RefCell::default(),
+            cancelled: RefCell::default(),
+            answer: RefCell::new(Box::new(answer)),
+        })
+    }
+
+    fn operations(&self) -> Vec<String> {
+        self.requests
+            .borrow()
+            .iter()
+            .map(|command| command.operation.clone())
+            .collect()
+    }
+
+    fn count(&self, operation: &str) -> usize {
+        self.operations()
+            .iter()
+            .filter(|op| *op == operation)
+            .count()
+    }
+
+    /// Answers the oldest held request for `operation`.
+    fn release(&self, operation: &str, value: Result<Value, String>) {
+        let mut held = self.held.borrow_mut();
+        let index = held
+            .iter()
+            .position(|(command, _)| command.operation == operation)
+            .unwrap_or_else(|| panic!("no held {operation}"));
+        let (_, sender) = held.remove(index);
+        let _ = sender.send(value);
+    }
+
+    fn transport(self: &Rc<Self>) -> Transport {
+        self.clone()
+    }
+}
+
+impl GitTransport for Fake {
+    fn request(&self, _: String, command: GitCommand) -> BoxFuture<'static, Result<Value, String>> {
+        self.requests.borrow_mut().push(command.clone());
+        let answer = (self.answer.borrow_mut())(&command);
+        match answer {
+            Some(answer) => futures::future::ready(answer).boxed(),
+            None => {
+                let (sender, receiver) = oneshot::channel();
+                self.held.borrow_mut().push((command, sender));
+                async move { receiver.await.unwrap_or(Err("dropped".into())) }.boxed()
+            }
+        }
+    }
+
+    fn cancel(&self, _: String, operation_id: String) {
+        self.cancelled.borrow_mut().push(operation_id);
+    }
+
+    fn read_content(
+        &self,
+        _: GitDiffContentCommand,
+        _: Arc<dyn EventSink>,
+    ) -> BoxFuture<'static, Result<String, String>> {
+        futures::future::ready(Err("no bulk lane".to_owned())).boxed()
+    }
+
+    fn cancel_content(&self, _: String, _: String) {}
+}
+
+/// "a.txt" and "dir/b.txt" as the host sends them.
+const A: &str = "YS50eHQ=";
+const B: &str = "ZGlyL2IudHh0";
+
+fn repository(id: &str) -> Value {
+    json!({ "repositoryId": id, "worktreeRoot": "/work", "headName": "main" })
+}
+
+fn entry(path: &str, display: &str, index: &str, worktree: &str) -> Value {
+    json!({
+        "path": path, "displayPath": display, "indexKind": index, "worktreeKind": worktree,
+        "untracked": worktree == "untracked",
+    })
+}
+
+fn status_in(repo: &str, generation: u64, entries: Vec<Value>) -> Value {
+    json!({
+        "repository": repository(repo),
+        "generation": generation.to_string(),
+        "sourceGeneration": format!("source-{generation}"),
+        "entries": entries,
+        "authoritative": true,
+    })
+}
+
+fn status(generation: u64) -> Value {
+    status_in(
+        "repo",
+        generation,
+        vec![entry(A, "a.txt", "none", "modified")],
+    )
+}
+
+fn diff_response(repo: &str, path_bytes: &[u8], generation: u64) -> Value {
+    json!({
+        "diff": {
+            "repository": repository(repo), "target": "unstaged", "path": path_bytes,
+            "displayPath": "a.txt", "oldContent": b"base\n", "newContent": b"changed\n",
+            "sourceGeneration": format!("source-{generation}"), "hunkCount": 1,
+        },
+        "status": status_in(repo, generation, vec![entry(A, "a.txt", "none", "modified")]),
+    })
+}
+
+fn applied(generation: u64) -> Value {
+    json!({ "command": { "outcome": "applied", "status": status(generation) } })
+}
+
+fn scope(token: &str, epoch: u64) -> GitScope {
+    GitScope {
+        client_id: "client".into(),
+        host_profile_id: "local".into(),
+        server_identity: "server".into(),
+        terminal_epoch: epoch,
+        root_path: "/work".into(),
+        root_token: token.into(),
+    }
+}
+
+fn live(epoch: u64) -> Live {
+    Live {
+        connected: true,
+        client_id: Some("client".into()),
+        terminal_epoch: epoch,
+        server_identity: Some("server".into()),
+        host_profile_id: "local".into(),
+    }
+}
+
+fn root(token: &str) -> RootInfo {
+    RootInfo {
+        path: "/work".into(),
+        token: token.into(),
+        git_worktree: true,
+    }
+}
+
+fn parse(value: Value) -> StatusSnapshot {
+    model::status(serde_json::from_value(value).unwrap()).unwrap()
+}
+
+fn snapshot(generation: u64) -> StatusSnapshot {
+    parse(status(generation))
+}
+
+fn unstaged_a() -> DiffRequest {
+    DiffRequest {
+        repository_id: "repo".into(),
+        path: A.into(),
+        original_path: None,
+        target: Target::Unstaged,
+    }
+}
+
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    futures::executor::block_on(future)
+}
+
+// The wire (`api.test.ts`).
+
+#[test]
+fn preserves_opaque_path_bytes_and_decimal_u64_generations() {
+    let parsed = parse(status_in(
+        "repo",
+        u64::MAX,
+        vec![entry(B, "dir/b.txt", "added", "none")],
+    ));
+    assert_eq!(parsed.generation, u64::MAX);
+    assert_eq!(parsed.entries[0].path, B);
+    assert_eq!(path_bytes(B), b"dir/b.txt");
+    assert_eq!(
+        parsed.entries[0].absolute_path.as_deref(),
+        Some("/work/dir/b.txt")
+    );
+}
+
+#[test]
+fn turns_malformed_event_generations_and_paths_into_scoped_errors() {
+    let mut bad = status(1);
+    bad["generation"] = json!("01");
+    let event = json!({ "watchId": "w", "rootToken": "t", "status": bad });
+    let events = watch_events(&event.to_string());
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0]
+            .update
+            .as_ref()
+            .unwrap_err()
+            .contains("decimal u64")
+    );
+
+    let not_base64 = status_in(
+        "repo",
+        1,
+        vec![entry("a.txt!", "a.txt", "none", "modified")],
+    );
+    let event = json!({ "watchId": "w", "rootToken": "t", "status": not_base64 });
+    assert!(watch_events(&event.to_string())[0].update.is_err());
+}
+
+#[test]
+fn routes_only_root_token_bound_status_events() {
+    let unbound = json!({ "watchId": "w", "status": status(1) });
+    assert!(watch_events(&unbound.to_string()).is_empty());
+    let failed = json!({ "watchId": "w", "rootToken": "t", "error": "gone" });
+    let events = watch_events(&failed.to_string());
+    assert_eq!(events[0].update, Err("gone".into()));
+    assert_eq!(events[0].root_token, "t");
+}
+
+#[test]
+fn rejects_stale_or_mismatched_diff_identity() {
+    let fake = Fake::new(|_| Some(Ok(diff_response("repo", b"other.txt", 2))));
+    let error = block_on(client::diff(
+        fake.transport(),
+        scope("t", 1),
+        unstaged_a(),
+        false,
+    ))
+    .unwrap_err();
+    assert_eq!(error, "Host returned a stale Git diff identity.");
+
+    // The diff matches, but the status it was read against is another
+    // repository's.
+    let fake = Fake::new(|_| {
+        let mut response = diff_response("repo", b"a.txt", 2);
+        response["status"] = status_in("other", 2, vec![]);
+        Some(Ok(response))
+    });
+    let error = block_on(client::diff(
+        fake.transport(),
+        scope("t", 1),
+        unstaged_a(),
+        false,
+    ))
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "Host returned a Git diff status for a different repository."
+    );
+}
+
+#[test]
+fn carries_the_authoritative_status_a_diff_was_read_against_in_one_round_trip() {
+    let fake = Fake::new(|_| Some(Ok(diff_response("repo", b"a.txt", 7))));
+    let (diff, status) = block_on(client::diff(
+        fake.transport(),
+        scope("t", 1),
+        unstaged_a(),
+        false,
+    ))
+    .unwrap();
+    assert_eq!(fake.operations(), ["diff"]);
+    assert_eq!(fake.requests.borrow()[0].path, b"a.txt");
+    assert_eq!(status.generation, 7);
+    assert_eq!(diff.new_content, b"changed\n");
+    assert_eq!(diff.hunk_count, 1);
+}
+
+#[test]
+fn addresses_mutations_by_opaque_path_and_refuses_discard_without_a_token() {
+    let fake = Fake::new(|_| Some(Ok(applied(2))));
+    let mutation = Mutation {
+        kind: MutationKind::StageFile,
+        path: B.into(),
+        original_path: None,
+        target: Target::Unstaged,
+        expected_status_generation: 1,
+        expected_source_generation: "source-1".into(),
+        hunk_index: None,
+        confirmation_token: None,
+    };
+    let transport = fake.transport();
+    block_on(client::mutate(
+        transport.clone(),
+        scope("t", 1),
+        "repo".into(),
+        mutation.clone(),
+    ))
+    .unwrap();
+    let sent = fake.requests.borrow()[0].clone();
+    assert_eq!(sent.path, b"dir/b.txt");
+    assert_eq!(sent.mutation, "stageFile");
+    assert_eq!(sent.expected_status_generation, "1");
+
+    let discard = Mutation {
+        kind: MutationKind::DiscardFile,
+        ..mutation
+    };
+    let error = block_on(client::mutate(
+        transport,
+        scope("t", 1),
+        "repo".into(),
+        discard,
+    ));
+    assert_eq!(error.unwrap_err(), "Discard requires confirmation.");
+    assert_eq!(fake.requests.borrow().len(), 1);
+}
+
+#[test]
+fn sends_a_commit_and_a_push_exactly_once() {
+    let fake = Fake::new(|command| {
+        Some(match command.operation.as_str() {
+            "commit" => Err("connection lost".into()),
+            _ => Ok(json!({ "command": { "outcome": "applied", "pushTarget": "origin/main" } })),
+        })
+    });
+    let transport = fake.transport();
+    let committed = block_on(client::commit(
+        transport.clone(),
+        scope("t", 1),
+        "repo".into(),
+        3,
+        "msg".into(),
+    ));
+    assert_eq!(committed.unwrap_err(), "connection lost");
+    let pushed = block_on(client::push(
+        transport.clone(),
+        scope("t", 1),
+        "repo".into(),
+        3,
+    ))
+    .unwrap();
+    assert_eq!(fake.operations(), ["commit", "push"]);
+    assert_eq!(model::pushed_to(&pushed), "Pushed to origin/main.");
+
+    let empty = block_on(client::commit(
+        transport,
+        scope("t", 1),
+        "repo".into(),
+        3,
+        " ".into(),
+    ));
+    assert_eq!(empty.unwrap_err(), "Enter a commit message.");
+    assert_eq!(fake.requests.borrow().len(), 2);
+}
+
+#[test]
+fn cancels_the_exact_live_read_when_its_reader_stops_waiting() {
+    let fake = Fake::new(|_| None);
+    let mut read = Box::pin(client::status(fake.transport(), scope("t", 1)));
+    assert!((&mut read).now_or_never().is_none());
+    drop(read);
+    let id = fake.requests.borrow()[0].operation_id.clone();
+    assert_eq!(*fake.cancelled.borrow(), [id]);
+
+    // A mutation is never cancelled behind the user's back.
+    let fake = Fake::new(|_| None);
+    let mut commit = Box::pin(client::commit(
+        fake.transport(),
+        scope("t", 1),
+        "repo".into(),
+        1,
+        "m".into(),
+    ));
+    assert!((&mut commit).now_or_never().is_none());
+    drop(commit);
+    assert!(fake.cancelled.borrow().is_empty());
+}
+
+// The domain controller's Git half.
+
+#[test]
+fn creates_no_request_scope_before_the_bridge_says_connected() {
+    let link = Live {
+        connected: false,
+        ..live(1)
+    };
+    assert_eq!(git_scope(&link, &root("t")), None);
+    assert_eq!(git_scope(&live(1), &root("t")), Some(scope("t", 1)));
+}
+
+#[test]
+fn requires_every_native_transport_identity() {
+    for link in [
+        Live {
+            client_id: None,
+            ..live(1)
+        },
+        Live {
+            server_identity: None,
+            ..live(1)
+        },
+        Live {
+            server_identity: Some(String::new()),
+            ..live(1)
+        },
+        live(0),
+    ] {
+        assert_eq!(git_scope(&link, &root("t")), None, "{link:?}");
+    }
+    assert_eq!(git_scope(&live(1), &root("")), None);
+}
+
+// The panel's model (`GitSidebar.test.tsx`).
+
+#[test]
+fn groups_conflicts_staged_unstaged_and_untracked_and_shows_nothing_ignored() {
+    let parsed = parse(status_in(
+        "repo",
+        1,
+        vec![
+            entry(A, "a.txt", "modified", "modified"),
+            entry(B, "dir/b.txt", "none", "untracked"),
+            json!({
+                "path": "Yy50eHQ=", "displayPath": "c.txt", "conflicted": true,
+                "conflictCode": "UU", "indexKind": "unmerged", "worktreeKind": "unmerged",
+            }),
+            json!({ "path": "ZC50eHQ=", "displayPath": "d.txt", "ignored": true, "worktreeKind": "ignored" }),
+        ],
+    ));
+    let groups = group_entries(&parsed.entries);
+    let names = |list: &Vec<&StatusEntry>| -> Vec<String> {
+        list.iter()
+            .map(|entry| entry.display_path.clone())
+            .collect()
+    };
+    assert_eq!(names(&groups.conflicts), ["c.txt"]);
+    assert_eq!(names(&groups.staged), ["a.txt"]);
+    assert_eq!(names(&groups.unstaged), ["a.txt"]);
+    assert_eq!(names(&groups.untracked), ["dir/b.txt"]);
+    assert_eq!(status_code(groups.conflicts[0], Target::Unstaged), "U");
+    assert_eq!(status_code(groups.staged[0], Target::Staged), "M");
+    assert_eq!(
+        status_title(groups.conflicts[0], Target::Unstaged),
+        "Conflict UU"
+    );
+    assert_eq!(split_display_path("dir/b.txt"), ("b.txt", "dir"));
+    assert!(!groups.is_empty());
+    // Ignored files alone leave the tree clean.
+    let ignored_only = parse(status_in(
+        "repo",
+        1,
+        vec![
+            json!({ "path": "ZC50eHQ=", "displayPath": "d.txt", "ignored": true, "worktreeKind": "ignored" }),
+        ],
+    ));
+    assert!(group_entries(&ignored_only.entries).is_empty());
+}
+
+#[test]
+fn reports_a_completed_command_separately_from_a_failed_status_refresh() {
+    let clean = model::response_command(model::response(applied(2)).unwrap()).unwrap();
+    assert!(!needs_notice(&clean));
+    assert_eq!(command_details(&clean, Verb::Commit), "Commit created.");
+    let result = CommandResult {
+        refresh_failed: true,
+        refresh_error: "timed out".into(),
+        ..clean
+    };
+    assert!(needs_notice(&result));
+    assert_eq!(
+        result_message(&result, "Commit created."),
+        "Commit created. Status refresh failed: timed out"
+    );
+    assert_eq!(
+        command_details(&result, Verb::Commit),
+        "Commit completed, but status refresh failed: timed out"
+    );
+}
+
+// The diff tab's model.
+
+fn place<'a>() -> DiffTabPlace<'a> {
+    DiffTabPlace {
+        host: "local",
+        server: "server",
+        session_id: "$1",
+        session_name: "work",
+        root_path: "/work",
+        root_token: "t",
+    }
+}
+
+#[test]
+fn opens_a_preview_that_a_pinned_open_promotes_and_never_demotes() {
+    let mut state = PersistedAppState::default();
+    let status = snapshot(1);
+    let entry = status.entries[0].clone();
+    let mut ids = ["first", "second"].into_iter();
+    let mut open = |state: &mut PersistedAppState, preview| {
+        open_git_diff_tab(
+            state,
+            &place(),
+            &entry,
+            Target::Unstaged,
+            &status,
+            preview,
+            || ids.next().unwrap().into(),
+        )
+    };
+    assert_eq!(open(&mut state, true), "first");
+    assert_eq!(state.app_tabs[0].preview, Some(true));
+    assert_eq!(state.app_tabs[0].kind, AppTabKind::GitDiff);
+    assert_eq!(state.app_tabs[0].title, "a.txt (unstaged)");
+    assert_eq!(model::tab_display_path(&state.app_tabs[0]), "a.txt");
+    assert_eq!(open(&mut state, false), "first");
+    assert_eq!(state.app_tabs[0].preview, None);
+    assert_eq!(open(&mut state, true), "first");
+    assert_eq!(state.app_tabs[0].preview, None);
+    assert_eq!(state.app_tabs.len(), 1);
+}
+
+#[test]
+fn shows_every_line_of_the_file_and_refuses_what_is_not_text() {
+    let patch = whole_file_patch(
+        "dir/a.rs",
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nEIGHT\n",
+    );
+    assert!(patch.starts_with("--- a/a.rs\n+++ b/a.rs\n"));
+    assert!(patch.contains(" one\n") && patch.contains("-eight\n+EIGHT\n"));
+    let parse_patch = gpui_kit::component::diff::DiffFile::parse;
+    assert_eq!(parse_patch(&patch).unwrap().len(), 1);
+    // A mode change has no text change, and the file is still shown.
+    let same = whole_file_patch("a.txt", "x\n", "x\n");
+    assert!(same.contains(" x\n"));
+    assert_eq!(parse_patch(&same).unwrap().len(), 1);
+    // An unusual name never reaches the patch header.
+    assert!(whole_file_patch("a b\n+++ c", "", "y\n").starts_with("--- a/file\n"));
+
+    let response = model::response(diff_response("repo", b"a.txt", 1)).unwrap();
+    let mut diff = model::response_diff(response, &unstaged_a()).unwrap().0;
+    assert!(matches!(shown_diff(&diff), Shown::Text { .. }));
+    diff.new_content = vec![0xff];
+    assert_eq!(
+        shown_diff(&diff),
+        Shown::Blocked("This diff contains non-UTF-8 content and is shown safely as binary.")
+    );
+    diff.binary = true;
+    assert_eq!(
+        shown_diff(&diff),
+        Shown::Blocked("Binary changes cannot be displayed or edited as text.")
+    );
+}
+
+// The shared observation (`repositoryStore.test.ts`, `useWorkspaceGit.test.tsx`).
+
+fn store(cx: &mut TestAppContext, fake: &Rc<Fake>) -> Entity<GitRepositories> {
+    let transport = fake.transport();
+    cx.new(|_| GitRepositories::new(transport))
+}
+
+fn watch_event(watch_id: &str, token: &str, generation: u64) -> WatchEvent {
+    WatchEvent {
+        watch_id: watch_id.into(),
+        root_token: token.into(),
+        update: Ok(snapshot(generation)),
+    }
+}
+
+fn generation(store: &Entity<GitRepositories>, key: &str, cx: &mut TestAppContext) -> Option<u64> {
+    store.read_with(cx, |store, _| {
+        store.state(key).status.map(|status| status.generation)
+    })
+}
+
+fn watching(command: &GitCommand) -> Option<Result<Value, String>> {
+    (command.operation == "watch").then(|| Ok(json!({ "status": status(1) })))
+}
+
+#[gpui_kit::test]
+fn gives_every_consumer_of_one_repository_the_same_watch_and_status(cx: &mut TestAppContext) {
+    let fake = Fake::new(watching);
+    let store = store(cx, &fake);
+    let key = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    cx.run_until_parked();
+    let second = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    assert_eq!(key, second);
+    assert_eq!(fake.count("watch"), 1);
+    assert_eq!(generation(&store, &key, cx), Some(1));
+
+    // Only the last release ends the watch.
+    store.update(cx, |store, cx| store.release(&key, cx));
+    cx.run_until_parked();
+    assert_eq!(fake.count("unwatch"), 0);
+    store.update(cx, |store, cx| store.release(&key, cx));
+    cx.run_until_parked();
+    assert_eq!(fake.count("unwatch"), 1);
+
+    // Re-acquired, it paints from the remembered status before the watch
+    // answers.
+    *fake.answer.borrow_mut() = Box::new(|_| None);
+    let key = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    let state = store.read_with(cx, |store, _| store.state(&key));
+    assert_eq!(state.status.map(|status| status.generation), Some(1));
+    assert!(state.loading);
+}
+
+#[gpui_kit::test]
+fn reconciles_events_that_beat_the_watch_and_ignores_other_watches(cx: &mut TestAppContext) {
+    let fake = Fake::new(|_| None);
+    let store = store(cx, &fake);
+    let key = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    cx.run_until_parked();
+    let watch_id = fake.requests.borrow()[0].watch_id.clone();
+    store.update(cx, |store, cx| {
+        store.handle_event(watch_event(&watch_id, "t", 3), cx);
+        store.handle_event(watch_event("someone-else", "t", 9), cx);
+        store.handle_event(watch_event(&watch_id, "other-root", 9), cx);
+    });
+    fake.release("watch", Ok(json!({ "status": status(2) })));
+    cx.run_until_parked();
+    assert_eq!(generation(&store, &key, cx), Some(3));
+
+    // Never regresses to an older generation, and another watch is not ours.
+    store.update(cx, |store, cx| {
+        store.handle_event(watch_event(&watch_id, "t", 2), cx);
+        store.handle_event(watch_event("someone-else", "t", 8), cx);
+    });
+    assert_eq!(generation(&store, &key, cx), Some(3));
+}
+
+#[gpui_kit::test]
+fn treats_an_identical_status_as_no_transition(cx: &mut TestAppContext) {
+    let fake = Fake::new(watching);
+    let store = store(cx, &fake);
+    let key = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    cx.run_until_parked();
+    let before = store.read_with(cx, |store, _| store.state(&key).status.unwrap());
+    store.update(cx, |store, cx| store.accept(&key, snapshot(1), cx));
+    let after = store.read_with(cx, |store, _| store.state(&key).status.unwrap());
+    assert!(Rc::ptr_eq(&before, &after));
+}
+
+#[gpui_kit::test]
+fn opens_no_second_watch_while_one_is_in_flight_and_restarts_a_failed_one(cx: &mut TestAppContext) {
+    let fake = Fake::new(|_| None);
+    let store = store(cx, &fake);
+    let key = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    // The store holds the refresh; the caller need not wait on it.
+    drop(store.update(cx, |store, cx| store.refresh(&key, cx)));
+    cx.run_until_parked();
+    assert_eq!(fake.operations(), ["watch", "status"]);
+    fake.release("status", Ok(json!({ "status": status(1) })));
+    cx.run_until_parked();
+    assert!(!store.read_with(cx, |store, _| store.state(&key).loading));
+
+    fake.release("watch", Err("helper restarted".into()));
+    cx.run_until_parked();
+    let state = store.read_with(cx, |store, _| store.state(&key));
+    assert_eq!(state.error.as_deref(), Some("helper restarted"));
+    // Asking again restarts the watch, and a status coming back clears the
+    // error.
+    // The store holds the refresh; the caller need not wait on it.
+    drop(store.update(cx, |store, cx| store.refresh(&key, cx)));
+    cx.run_until_parked();
+    assert_eq!(fake.count("watch"), 2);
+    fake.release("status", Ok(json!({ "status": status(2) })));
+    cx.run_until_parked();
+    let state = store.read_with(cx, |store, _| store.state(&key));
+    assert_eq!(state.error, None);
+    assert_eq!(state.status.map(|status| status.generation), Some(2));
+}
+
+// The panel (`GitSidebar.test.tsx`, `useWorkspaceGit.test.tsx`).
+
+struct Panel {
+    fake: Rc<Fake>,
+    store: Entity<GitRepositories>,
+    panel: Entity<GitPanel>,
+    messages: Rc<RefCell<Vec<String>>>,
+    /// The window the commit form lives in.
+    window: gpui_kit::AnyWindowHandle,
+}
+
+impl Panel {
+    fn new(
+        cx: &mut TestAppContext,
+        answer: impl FnMut(&GitCommand) -> Option<Result<Value, String>> + 'static,
+    ) -> Self {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(crate::app::Core::at(std::path::Path::new(
+                "/nonexistent/app-state.json",
+            )));
+            crate::commands::init(cx);
+        });
+        let fake = Fake::new(answer);
+        let store = store(cx, &fake);
+        let owner = store.clone();
+        let panel = cx.new(|cx| GitPanel::new(owner, cx));
+        let messages = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let messages = messages.clone();
+            cx.subscribe(&panel, move |_, event, _| {
+                if let PanelEvent::Message(message) = event {
+                    messages.borrow_mut().push(message.clone());
+                }
+            })
+            .detach();
+        });
+        cx.add_empty_window();
+        let window = *cx.windows().last().unwrap();
+        Self {
+            fake,
+            store,
+            panel,
+            messages,
+            window,
+        }
+    }
+
+    fn point_at(&self, token: &str, epoch: u64, cx: &mut TestAppContext) {
+        let context = PanelContext::new(Some(root(token)), live(epoch), true);
+        self.panel
+            .update(cx, |panel, cx| panel.set_context(context, cx));
+        cx.run_until_parked();
+    }
+
+    fn entry(&self, cx: &mut TestAppContext) -> StatusEntry {
+        self.panel
+            .read_with(cx, |panel, cx| panel.status(cx).unwrap().entries[0].clone())
+    }
+
+    fn pending_discard(&self, cx: &mut TestAppContext) -> Option<super::panel::PendingDiscard> {
+        let entry = self.entry(cx);
+        self.panel.read_with(cx, |panel, cx| {
+            panel.pending_discard(&entry, Target::Unstaged, cx)
+        })
+    }
+
+    fn run(&self, work: Work, cx: &mut TestAppContext) {
+        let panel = self.panel.clone();
+        cx.update_window(self.window, |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.run(work, window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn type_message(&self, text: &str, cx: &mut TestAppContext) {
+        let panel = self.panel.clone();
+        cx.update_window(self.window, |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.set_message(text, window, cx))
+        })
+        .unwrap();
+    }
+}
+
+fn answering(command: &GitCommand) -> Option<Result<Value, String>> {
+    Some(Ok(match command.operation.as_str() {
+        "watch" | "status" => json!({ "status": status(1) }),
+        "prepareDiscard" => json!({ "confirmation": { "token": "once" } }),
+        _ => applied(2),
+    }))
+}
+
+#[gpui_kit::test]
+fn holds_one_observation_across_a_pane_switch_within_the_same_worktree(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    panel.point_at("t", 1, cx);
+    panel.point_at("t", 1, cx);
+    assert_eq!(panel.fake.operations(), ["watch"]);
+    // A different epoch is a different connection: the old watch ends.
+    panel.point_at("t", 2, cx);
+    assert_eq!(panel.fake.operations(), ["watch", "unwatch", "watch"]);
+}
+
+#[gpui_kit::test]
+fn stages_a_row_and_says_nothing_when_the_refreshed_row_shows_it(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    panel.point_at("t", 1, cx);
+    let entry = panel.entry(cx);
+    panel.panel.update(cx, |panel, cx| {
+        panel.mutate_file(&entry, Target::Unstaged, MutationKind::StageFile, None, cx)
+    });
+    cx.run_until_parked();
+    let sent = panel.fake.requests.borrow().last().unwrap().clone();
+    assert_eq!(sent.operation, "mutate");
+    assert_eq!(sent.mutation, "stageFile");
+    assert_eq!(sent.path, b"a.txt");
+    assert!(panel.messages.borrow().is_empty());
+    let generation = panel
+        .panel
+        .read_with(cx, |panel, cx| panel.status(cx).unwrap().generation);
+    assert_eq!(generation, 2);
+}
+
+#[gpui_kit::test]
+fn mints_a_discard_token_only_after_confirmation(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    panel.point_at("t", 1, cx);
+    let pending = panel.pending_discard(cx).unwrap();
+    assert_eq!(panel.fake.operations(), ["watch"]);
+    panel
+        .panel
+        .update(cx, |panel, cx| panel.confirm_discard(pending, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        panel.fake.operations(),
+        ["watch", "prepareDiscard", "mutate"]
+    );
+    assert_eq!(panel.fake.requests.borrow()[2].confirmation_token, "once");
+}
+
+#[gpui_kit::test]
+fn cancels_a_confirmed_discard_once_the_connection_changed(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    panel.point_at("t", 1, cx);
+    let pending = panel.pending_discard(cx).unwrap();
+    panel.point_at("t", 2, cx);
+    panel
+        .panel
+        .update(cx, |panel, cx| panel.confirm_discard(pending, cx));
+    cx.run_until_parked();
+    assert_eq!(panel.fake.count("prepareDiscard"), 0);
+    assert_eq!(
+        *panel.messages.borrow(),
+        ["Discard was cancelled because the repository connection changed."]
+    );
+}
+
+#[gpui_kit::test]
+fn offers_no_mutation_while_the_status_is_resynchronizing(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        let mut status = status(1);
+        status["authoritative"] = json!(false);
+        (command.operation == "watch").then(|| Ok(json!({ "status": status })))
+    });
+    panel.point_at("t", 1, cx);
+    assert!(panel.pending_discard(cx).is_none());
+    let entry = panel.entry(cx);
+    panel.panel.update(cx, |panel, cx| {
+        panel.mutate_file(&entry, Target::Unstaged, MutationKind::StageFile, None, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(panel.fake.operations(), ["watch"]);
+}
+
+#[gpui_kit::test]
+fn rejects_an_empty_commit_message_before_invoking_git(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    panel.point_at("t", 1, cx);
+    panel.run(Work::Commit, cx);
+    assert_eq!(panel.fake.operations(), ["watch"]);
+    let (error, _, _) = panel.panel.read_with(cx, |panel, _| panel.form_state());
+    assert_eq!(error.as_deref(), Some("Enter a commit message."));
+}
+
+#[gpui_kit::test]
+fn leaves_the_commit_form_behind_with_its_repository(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    panel.point_at("t", 1, cx);
+    panel.run(Work::Commit, cx);
+    panel.type_message("meant for t", cx);
+    panel.point_at("u", 1, cx);
+    assert_eq!(
+        panel.panel.read_with(cx, |panel, _| panel.form_state()),
+        (None, None, None)
+    );
+    assert_eq!(
+        panel
+            .panel
+            .read_with(cx, |panel, cx| panel.message_text(cx)),
+        ""
+    );
+}
+
+#[gpui_kit::test]
+fn never_reports_a_push_the_host_could_not_confirm_as_one_that_worked(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        Some(Ok(match command.operation.as_str() {
+            "watch" => json!({ "status": status(1) }),
+            _ => json!({ "command": { "outcome": "partialOrUnknown", "status": status(1) } }),
+        }))
+    });
+    panel.point_at("t", 1, cx);
+    panel.run(Work::Push, cx);
+    assert_eq!(panel.fake.operations(), ["watch", "push"]);
+    // Nothing claims the push is still running, either.
+    assert_eq!(
+        panel.panel.read_with(cx, |panel, _| panel.form_state()),
+        (
+            Some("Push outcome is unknown; check the remote before retrying.".to_owned()),
+            None,
+            None
+        )
+    );
+}
+
+// The diff tab (`GitDiffSurface.test.tsx`).
+
+fn tab(repository: &str) -> AppTabRecord {
+    let mut state = PersistedAppState::default();
+    let mut status = snapshot(1);
+    status.repository.id = repository.into();
+    let entry = status.entries[0].clone();
+    open_git_diff_tab(
+        &mut state,
+        &place(),
+        &entry,
+        Target::Unstaged,
+        &status,
+        false,
+        || "tab".into(),
+    );
+    state.app_tabs.remove(0)
+}
+
+fn diff_view(panel: &Panel, repository: &str, cx: &mut TestAppContext) -> Entity<GitDiffView> {
+    panel.point_at("t", 1, cx);
+    let owner = panel.panel.clone();
+    let tab = tab(repository);
+    let view = cx.new(|cx| GitDiffView::new(owner, tab, cx));
+    cx.run_until_parked();
+    view
+}
+
+fn with_diffs(command: &GitCommand) -> Option<Result<Value, String>> {
+    Some(Ok(match command.operation.as_str() {
+        "diff" => diff_response("repo", b"a.txt", 1),
+        "mutate" => applied(2),
+        _ => json!({ "status": status(1) }),
+    }))
+}
+
+#[gpui_kit::test]
+fn opens_a_diff_in_one_request_beside_the_panel_watch(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, with_diffs);
+    let view = diff_view(&panel, "repo", cx);
+    assert_eq!(panel.fake.operations(), ["watch", "diff"]);
+    assert_eq!(view.read_with(cx, |view, _| view.shown()), (true, None));
+
+    // The same status published again owes no second read; a newer one does.
+    let watch_id = panel.fake.requests.borrow()[0].watch_id.clone();
+    for generation in [1, 2] {
+        panel.store.update(cx, |store, cx| {
+            store.handle_event(watch_event(&watch_id, "t", generation), cx)
+        });
+        cx.run_until_parked();
+    }
+    assert_eq!(panel.fake.count("diff"), 2);
+
+    // Closing the tab keeps the panel's watch.
+    drop(view);
+    cx.run_until_parked();
+    assert_eq!(panel.fake.count("unwatch"), 0);
+}
+
+#[gpui_kit::test]
+fn fails_closed_without_a_request_for_a_tab_of_another_repository(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    let view = diff_view(&panel, "elsewhere", cx);
+    assert_eq!(panel.fake.operations(), ["watch"]);
+    let (drawn, error) = view.read_with(cx, |view, _| view.shown());
+    assert!(!drawn);
+    assert_eq!(
+        error.as_deref(),
+        Some(
+            "This diff belongs to a different repository. Return to its workspace or close the tab."
+        )
+    );
+}
+
+#[gpui_kit::test]
+fn asks_nothing_for_a_file_the_status_says_no_longer_changed(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        let clean = status_in("repo", 1, vec![]);
+        (command.operation == "watch").then(|| Ok(json!({ "status": clean })))
+    });
+    let view = diff_view(&panel, "repo", cx);
+    assert_eq!(panel.fake.operations(), ["watch"]);
+    assert_eq!(view.read_with(cx, |view, _| view.shown()), (false, None));
+}
+
+#[gpui_kit::test]
+fn only_a_slow_diff_says_it_is_loading(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        (command.operation != "diff").then(|| Ok(json!({ "status": status(1) })))
+    });
+    let view = diff_view(&panel, "repo", cx);
+    let shown = |cx: &mut TestAppContext| {
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| (view.loading(), view.loading_shown()))
+    };
+    // DelayedLoading's 150 ms: a fast diff never flashes the line.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(140));
+    assert_eq!(shown(cx), (true, false));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(10));
+    assert_eq!(shown(cx), (true, true));
+    panel
+        .fake
+        .release("diff", Ok(diff_response("repo", b"a.txt", 1)));
+    assert_eq!(shown(cx), (false, false));
+}
+
+#[gpui_kit::test]
+fn surfaces_a_failed_shared_bootstrap_instead_of_loading_forever(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |_| Some(Err("helper gone".into())));
+    let view = diff_view(&panel, "repo", cx);
+    let (loading, shown) = view.read_with(cx, |view, _| (view.loading(), view.shown()));
+    assert!(!loading);
+    assert_eq!(shown, (false, Some("helper gone".to_owned())));
+}
+
+#[gpui_kit::test]
+fn reloads_the_remaining_diff_once_after_a_hunk_is_staged(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, with_diffs);
+    let view = diff_view(&panel, "repo", cx);
+    view.update(cx, |view, cx| view.stage_hunk(0, cx));
+    cx.run_until_parked();
+    assert_eq!(panel.fake.operations(), ["watch", "diff", "mutate", "diff"]);
+    let mutate = panel.fake.requests.borrow()[2].clone();
+    assert_eq!(mutate.mutation, "stageHunk");
+    assert_eq!(mutate.hunk_index, 0);
+    assert_eq!(mutate.expected_source_generation, "source-1");
+}
+
+#[gpui_kit::test]
+fn a_released_entry_s_late_refresh_does_not_land_in_its_successor(cx: &mut TestAppContext) {
+    let fake = Fake::new(|_| None);
+    let store = store(cx, &fake);
+    let key = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    drop(store.update(cx, |store, cx| store.refresh(&key, cx)));
+    cx.run_until_parked();
+    store.update(cx, |store, cx| store.release(&key, cx));
+    let key = store.update(cx, |store, cx| store.acquire(&scope("t", 1), cx));
+    cx.run_until_parked();
+    fake.release("status", Err("from the old connection".into()));
+    cx.run_until_parked();
+    let state = store.read_with(cx, |store, _| store.state(&key));
+    assert_eq!(state.error, None);
+    assert!(state.loading);
+}
+
+#[gpui_kit::test]
+fn a_diff_newer_than_the_observation_moves_the_observation(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        Some(Ok(match command.operation.as_str() {
+            "diff" => diff_response("repo", b"a.txt", 4),
+            _ => json!({ "status": status(1) }),
+        }))
+    });
+    let _view = diff_view(&panel, "repo", cx);
+    let generation = panel
+        .panel
+        .read_with(cx, |panel, cx| panel.status(cx).unwrap().generation);
+    assert_eq!(generation, 4);
+    assert_eq!(panel.fake.count("diff"), 1);
+}
+
+#[test]
+fn assembles_withheld_bodies_in_order_and_refuses_gaps() {
+    let size = |size| ContentRef {
+        size,
+        digest: "d".into(),
+    };
+    let chunk = |side: u8, offset: u64, data: &[u8]| {
+        let mut frame = vec![1, side];
+        frame.extend_from_slice(&offset.to_be_bytes());
+        frame.extend_from_slice(data);
+        frame
+    };
+    let mut bodies = DeferredBodies::new(Some(&size(5)), Some(&size(3))).unwrap();
+    assert_eq!(bodies.accept(&chunk(1, 0, b"ba")), Ok(false));
+    assert_eq!(bodies.accept(&chunk(1, 2, b"se\n")), Ok(false));
+    assert!(
+        bodies.accept(&[2]).is_err(),
+        "the new side is still missing"
+    );
+    assert_eq!(bodies.accept(&chunk(2, 0, b"ne\n")), Ok(false));
+    assert_eq!(bodies.accept(&[2]), Ok(true));
+    let response = model::response(diff_response("repo", b"a.txt", 1)).unwrap();
+    let mut diff = model::response_diff(response, &unstaged_a()).unwrap().0;
+    bodies.fill(&mut diff);
+    assert_eq!(
+        (diff.old_content, diff.new_content),
+        (b"base\n".to_vec(), b"ne\n".to_vec())
+    );
+
+    let mut bodies = DeferredBodies::new(Some(&size(4)), None).unwrap();
+    assert!(bodies.accept(&chunk(1, 1, b"x")).is_err());
+    assert!(bodies.accept(&chunk(2, 0, b"x")).is_err());
+    assert!(DeferredBodies::new(Some(&size(0)), None).is_err());
+}
+
+#[test]
+fn draws_a_file_with_a_lone_carriage_return() {
+    let patch = whole_file_patch("log.txt", "a\rb\nc\n", "a\rB\nc\n");
+    let files = gpui_kit::component::diff::DiffFile::parse(&patch);
+    assert!(files.is_ok(), "{patch:?}");
+}
+
+fn commit_answers(
+    commit: Value,
+) -> impl FnMut(&GitCommand) -> Option<Result<Value, String>> + 'static {
+    move |command| {
+        Some(Ok(match command.operation.as_str() {
+            "watch" | "status" => json!({ "status": status(1) }),
+            "commit" => commit.clone(),
+            _ => {
+                json!({ "command": { "outcome": "applied", "pushTarget": "origin/main", "status": status(3) } })
+            }
+        }))
+    }
+}
+
+#[gpui_kit::test]
+fn commits_and_then_pushes_against_the_status_the_commit_left(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, commit_answers(applied(2)));
+    panel.point_at("t", 1, cx);
+    panel.type_message("message", cx);
+    panel.run(Work::CommitAndPush, cx);
+    assert_eq!(panel.fake.operations(), ["watch", "commit", "push"]);
+    assert_eq!(
+        panel.fake.requests.borrow()[2].expected_status_generation,
+        "2"
+    );
+    let (error, note, progress) = panel.panel.read_with(cx, |panel, _| panel.form_state());
+    assert_eq!(error, None);
+    assert_eq!(note.as_deref(), Some("Committed. Pushed to origin/main."));
+    assert_eq!(progress, None);
+}
+
+#[gpui_kit::test]
+fn does_not_talk_to_the_remote_when_the_chained_commit_did_not_happen(cx: &mut TestAppContext) {
+    let panel = Panel::new(
+        cx,
+        commit_answers(
+            json!({ "command": { "outcome": "notApplied", "exitCode": 1, "status": status(1) } }),
+        ),
+    );
+    panel.point_at("t", 1, cx);
+    panel.type_message("message", cx);
+    panel.run(Work::CommitAndPush, cx);
+    assert_eq!(panel.fake.operations(), ["watch", "commit"]);
+    let (error, _, progress) = panel.panel.read_with(cx, |panel, _| panel.form_state());
+    assert_eq!(error.as_deref(), Some("Git did not create a commit."));
+    assert_eq!(progress, None);
+}
+
+#[gpui_kit::test]
+fn does_not_push_once_the_commit_left_the_status_resynchronizing(cx: &mut TestAppContext) {
+    let mut resynchronizing = status(2);
+    resynchronizing["authoritative"] = json!(false);
+    let panel = Panel::new(
+        cx,
+        commit_answers(json!({ "command": { "outcome": "applied", "status": resynchronizing } })),
+    );
+    panel.point_at("t", 1, cx);
+    panel.type_message("message", cx);
+    panel.run(Work::CommitAndPush, cx);
+    assert_eq!(panel.fake.operations(), ["watch", "commit"]);
+    let (error, _, progress) = panel.panel.read_with(cx, |panel, _| panel.form_state());
+    assert_eq!(error.as_deref(), Some("Git is not available right now."));
+    assert_eq!(progress, None);
+}
+
+#[gpui_kit::test]
+fn follows_the_tab_to_another_file_on_the_same_observation(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        Some(Ok(match command.operation.as_str() {
+            "diff" if command.path == b"a.txt" => diff_response("repo", b"a.txt", 1),
+            "diff" => {
+                let mut response = diff_response("repo", b"dir/b.txt", 1);
+                response["diff"]["displayPath"] = json!("dir/b.txt");
+                response["status"] = status_in(
+                    "repo",
+                    1,
+                    vec![
+                        entry(A, "a.txt", "none", "modified"),
+                        entry(B, "dir/b.txt", "none", "modified"),
+                    ],
+                );
+                response
+            }
+            _ => json!({ "status": status_in("repo", 1, vec![
+                entry(A, "a.txt", "none", "modified"),
+                entry(B, "dir/b.txt", "none", "modified"),
+            ]) }),
+        }))
+    });
+    let view = diff_view(&panel, "repo", cx);
+    let mut repointed = tab("repo");
+    repointed.git_path = Some(B.into());
+    repointed.resource = "unstaged:dir/b.txt".into();
+    view.update(cx, |view, cx| view.set_tab(&repointed, cx));
+    cx.run_until_parked();
+    assert_eq!(panel.fake.operations(), ["watch", "diff", "diff"]);
+    assert_eq!(panel.fake.requests.borrow()[2].path, b"dir/b.txt");
+    assert_eq!(view.read_with(cx, |view, _| view.shown()), (true, None));
+}
+
+#[gpui_kit::test]
+fn asks_nothing_of_a_host_that_is_not_the_tab_s_own(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, with_diffs);
+    panel.point_at("t", 1, cx);
+    let mut elsewhere = tab("repo");
+    elsewhere.host_profile_id = "other-host".into();
+    let owner = panel.panel.clone();
+    let view = cx.new(|cx| GitDiffView::new(owner, elsewhere, cx));
+    cx.run_until_parked();
+    // Only the panel's own watch: the tab waits for its host.
+    assert_eq!(panel.fake.operations(), ["watch"]);
+    assert_eq!(view.read_with(cx, |view, _| view.shown()), (false, None));
+}
+
+/// The mode is switched before the list is laid out, because the list counts
+/// the rows of the mode it was built in. Switching while painting left the
+/// list indexing rows of the other mode, and the window panicked on narrowing.
+#[gpui_kit::test]
+fn the_diff_survives_a_window_resize_across_the_side_by_side_width(cx: &mut TestAppContext) {
+    use desktop_core::app_state::ThemePreference;
+    use gpui_kit::{WindowAppearance, px, size};
+
+    let panel = Panel::new(cx, with_diffs);
+    cx.update(|cx| crate::theme::apply(ThemePreference::Light, 1., WindowAppearance::Light, cx));
+    panel.point_at("t", 1, cx);
+    let owner = panel.panel.clone();
+    let record = tab("repo");
+    let (view, cx) = cx.add_window_view(move |_, cx| GitDiffView::new(owner, record, cx));
+    cx.run_until_parked();
+    for width in [1400., 500., 1400., 500.] {
+        cx.simulate_resize(size(px(width), px(600.)));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+    assert_eq!(view.read_with(cx, |view, _| view.shown()), (true, None));
+}
+
+#[gpui_kit::test]
+fn a_row_is_a_tab_stop_with_its_actions_next_and_its_menu_on_the_menu_key(cx: &mut TestAppContext) {
+    use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
+
+    let panel = Panel::new(cx, |command| match command.operation.as_str() {
+        "mutate" => Some(Ok(
+            json!({ "command": { "outcome": "applied", "status": status_in(
+            "repo",
+            2,
+            vec![entry(A, "a.txt", "modified", "none")],
+        ) } }),
+        )),
+        _ => answering(command),
+    });
+    cx.update(|cx| {
+        crate::theme::apply(
+            desktop_core::app_state::ThemePreference::Light,
+            1.,
+            gpui_kit::WindowAppearance::Light,
+            cx,
+        );
+        crate::context_menu::init(cx);
+    });
+    let previews = Rc::new(RefCell::new(Vec::new()));
+    cx.update(|cx| {
+        let previews = previews.clone();
+        cx.subscribe(&panel.panel, move |_, event, _| {
+            if let PanelEvent::OpenDiff { entry, preview, .. } = event {
+                previews
+                    .borrow_mut()
+                    .push((entry.display_path.clone(), *preview));
+            }
+        })
+        .detach();
+    });
+    let shown = cx.new(|_| crate::context_menu::WithMenus(panel.panel.clone().into()));
+    let (_, visual) =
+        cx.add_window_view(move |window, cx| gpui_kit::base::Root::new(shown, window, cx));
+    let context = PanelContext::new(Some(root("t")), live(1), true);
+    panel
+        .panel
+        .update(visual, |panel, cx| panel.set_context(context, cx));
+    visual.run_until_parked();
+    let focused = |label: &str, visual: &mut gpui_kit::VisualTestContext| {
+        visual.update(|window, _| {
+            window
+                .try_find_by_label(label)
+                .is_some_and(|element| element.focused() == Some(true))
+        })
+    };
+    let shown = |label: &str, visual: &mut gpui_kit::VisualTestContext| {
+        visual.update(|window, _| {
+            window
+                .try_find_by_label(label)
+                .is_some_and(|element| element.visible())
+        })
+    };
+    assert!(
+        !shown("Stage file", visual),
+        "a pointer affordance until then"
+    );
+
+    visual.update(|window, cx| window.focus_next(cx));
+    let reached = (0..10).any(|_| {
+        if focused("a.txt", visual) {
+            return true;
+        }
+        visual.simulate_keystrokes("tab");
+        false
+    });
+    assert!(reached, "Tab reaches the row");
+    assert!(
+        shown("Stage file", visual),
+        "the row's actions show with it"
+    );
+    visual.simulate_keystrokes("tab");
+    assert!(focused("Stage file", visual), "and come next");
+    visual.simulate_keystrokes("shift-tab");
+    assert!(focused("a.txt", visual));
+
+    visual.update(|window, cx| window.press("enter", cx));
+    assert_eq!(*previews.borrow(), [("a.txt".to_owned(), true)], "once");
+
+    visual.simulate_keystrokes("shift-f10");
+    visual.update(|window, cx| assert!(crate::context_menu::is_open(window, cx)));
+    visual.simulate_keystrokes("escape");
+    visual.update(|window, cx| assert!(!crate::context_menu::is_open(window, cx)));
+    assert!(focused("a.txt", visual), "the menu hands the keyboard back");
+
+    // Staged, the row moves to its new group and the keyboard with it, before
+    // anything that claims a keyboard left nowhere (the terminal does) can.
+    let elsewhere = visual.update(|_, cx| cx.focus_handle());
+    panel.panel.update_in(visual, |_, window, cx| {
+        let elsewhere = elsewhere.clone();
+        cx.on_focus_lost(window, move |_, window, cx| window.focus(&elsewhere, cx))
+            .detach();
+    });
+    visual.simulate_keystrokes("shift-f10");
+    for _ in 0..2 {
+        visual.update(|window, cx| {
+            window.refresh();
+            window.simulate_next_frame(cx);
+        });
+        visual.run_until_parked();
+    }
+    visual.simulate_keystrokes("down");
+    visual.update(|window, cx| window.press("enter", cx));
+    visual.run_until_parked();
+    let staged = visual.update(|window, _| {
+        window
+            .elements()
+            .into_iter()
+            .find(|element| element.label() == Some("a.txt"))
+            .map(|element| (element.path().last().cloned(), element.focused()))
+    });
+    assert_eq!(
+        staged,
+        Some((Some("git-row-staged-YS50eHQ=".into()), Some(true))),
+        "not left nowhere, nor to an editor"
+    );
+    assert!(
+        shown("Unstage file", visual),
+        "with its actions, as a row the keyboard reached"
+    );
+}
+
+/// Tauri commits on Ctrl+Enter or Meta+Enter. On a Mac the Kit binds only
+/// Cmd+Enter, so this runs as one.
+#[gpui_kit::test]
+fn commits_on_ctrl_enter_in_the_message_box_on_a_mac_too(cx: &mut TestAppContext) {
+    use gpui_kit::{
+        Modifiers, OperatingSystem, PlatformInfo, PlatformTarget, test::TestQueryExt as _,
+    };
+
+    cx.set_platform_info(PlatformInfo {
+        os: OperatingSystem::Mac,
+        target: PlatformTarget::Native,
+    });
+    let staged = status_in("repo", 1, vec![entry(A, "a.txt", "modified", "none")]);
+    let panel = Panel::new(cx, move |command| {
+        Some(Ok(match command.operation.as_str() {
+            "commit" => applied(2),
+            _ => json!({ "status": staged.clone() }),
+        }))
+    });
+    cx.update(|cx| {
+        crate::theme::apply(
+            desktop_core::app_state::ThemePreference::Light,
+            1.,
+            gpui_kit::WindowAppearance::Light,
+            cx,
+        );
+        super::panel::init(cx);
+    });
+    let shown = panel.panel.clone();
+    let (_, visual) =
+        cx.add_window_view(move |window, cx| gpui_kit::base::Root::new(shown, window, cx));
+    let context = PanelContext::new(Some(root("t")), live(1), true);
+    panel
+        .panel
+        .update(visual, |panel, cx| panel.set_context(context, cx));
+    visual.run_until_parked();
+    panel.panel.update_in(visual, |panel, window, cx| {
+        panel.set_message("message", window, cx)
+    });
+    visual.run_until_parked();
+    let field = visual.update(|window, _| window.find_by_label("Commit message").bounds().center());
+    visual.simulate_click(field, Modifiers::none());
+    visual.simulate_keystrokes("ctrl-enter");
+    visual.run_until_parked();
+    assert_eq!(panel.fake.operations(), ["watch", "commit"]);
+}
+
+/// `GitDiffSurface.tsx`: an open diff whose file was staged and committed says
+/// so.
+#[gpui_kit::test]
+fn an_open_diff_says_its_file_no_longer_changed_after_a_stage_and_commit(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+
+    let phase = Rc::new(std::cell::Cell::new(0));
+    let host = phase.clone();
+    let panel = Panel::new(cx, move |command| {
+        let status = |phase| match phase {
+            0 => status(1),
+            1 => status_in("repo", 2, vec![entry(A, "a.txt", "modified", "none")]),
+            _ => status_in("repo", 3, vec![]),
+        };
+        Some(Ok(match command.operation.as_str() {
+            "diff" => diff_response("repo", b"a.txt", 1),
+            "mutate" => {
+                host.set(1);
+                json!({ "command": { "outcome": "applied", "status": status(1) } })
+            }
+            "commit" => {
+                host.set(2);
+                json!({ "command": { "outcome": "applied", "status": status(2) } })
+            }
+            _ => json!({ "status": status(host.get()) }),
+        }))
+    });
+    cx.update(|cx| {
+        crate::theme::apply(
+            desktop_core::app_state::ThemePreference::Light,
+            1.,
+            gpui_kit::WindowAppearance::Light,
+            cx,
+        )
+    });
+    panel.point_at("t", 1, cx);
+    let owner = panel.panel.clone();
+    let record = tab("repo");
+    let (view, visual) = cx.add_window_view(move |_, cx| GitDiffView::new(owner, record, cx));
+    visual.run_until_parked();
+    assert_eq!(view.read_with(visual, |view, _| view.shown()), (true, None));
+
+    let entry = panel.panel.read_with(visual, |panel, cx| {
+        panel.status(cx).unwrap().entries[0].clone()
+    });
+    panel.panel.update(visual, |panel, cx| {
+        panel.mutate_file(&entry, Target::Unstaged, MutationKind::StageFile, None, cx)
+    });
+    visual.run_until_parked();
+    panel.panel.update_in(visual, |panel, window, cx| {
+        panel.set_message("message", window, cx);
+        panel.run(Work::Commit, window, cx);
+    });
+    visual.run_until_parked();
+    assert_eq!(phase.get(), 2, "committed");
+    visual
+        .executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.render_frame(cx));
+
+    let (shown, loading) = view.read_with(visual, |view, _| (view.shown(), view.loading()));
+    assert_eq!((shown, loading), ((false, None), false));
+    let said = visual.update(|window, _| {
+        window
+            .try_find("git-diff-empty")
+            .is_some_and(|element| element.visible())
+    });
+    assert!(said, "This file no longer has unstaged changes.");
+}
+
+// The hunks view and the default-branch scope.
+
+const TWO_HUNKS: &str = "diff --git a/a.txt b/a.txt\nindex 1..2 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@ fn first\n-one\n+ONE\n two\n three\n@@ -10,2 +10,3 @@\n ten\n+ten and a half\n eleven\n\\ No newline at end of file\n";
+
+#[test]
+fn splits_git_s_patch_into_the_host_s_hunks_each_drawable_alone() {
+    let hunks = split_hunks("dir/a.txt", TWO_HUNKS);
+    assert_eq!(
+        hunks
+            .iter()
+            .map(|hunk| (
+                hunk.header.as_str(),
+                hunk.key.as_str(),
+                hunk.added,
+                hunk.removed
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("@@ -1,3 +1,3 @@ fn first", "1/a.txt", 1, 1),
+            ("@@ -10,2 +10,3 @@", "2/a.txt", 1, 0),
+        ]
+    );
+    for hunk in &hunks {
+        let files = gpui_kit::component::diff::DiffFile::parse(&hunk.patch).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path().as_ref(), hunk.key);
+    }
+    assert!(hunks[1].patch.ends_with("\\ No newline at end of file\n"));
+    // A name the patch header could misread is replaced, as for the whole file.
+    assert_eq!(split_hunks("a b", TWO_HUNKS)[0].key, "1/file");
+    assert!(split_hunks("a.txt", "Binary files a and b differ\n").is_empty());
+    // A type change is two sections: the second's header joins no hunk.
+    let type_change = "diff --git a/x b/x\ndeleted file mode 100644\n--- a/x\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\ndiff --git a/x b/x\nnew file mode 120000\n--- /dev/null\n+++ b/x\n@@ -0,0 +1 @@\n+target\n";
+    let hunks = split_hunks("x", type_change);
+    assert_eq!(
+        hunks
+            .iter()
+            .map(|hunk| (hunk.added, hunk.removed))
+            .collect::<Vec<_>>(),
+        [(0, 1), (1, 0)]
+    );
+    assert!(!hunks[0].patch.contains("diff --git"));
+}
+
+#[test]
+fn reads_the_patch_the_base_target_and_the_branch_summary() {
+    let mut response = diff_response("repo", b"a.txt", 1);
+    response["diff"]["target"] = json!("base");
+    response["diff"]["patch"] = json!(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        TWO_HUNKS
+    ));
+    let request = DiffRequest {
+        target: Target::Base,
+        ..unstaged_a()
+    };
+    let (diff, _) = model::response_diff(model::response(response).unwrap(), &request).unwrap();
+    assert_eq!(diff.target, Target::Base);
+    assert_eq!(diff.patch, TWO_HUNKS.as_bytes());
+
+    let summary = model::response_branch_summary(
+        model::response(json!({ "branchSummary": {
+            "baseRef": "origin/main", "mergeBaseOid": "abc",
+            "files": [{ "path": A, "displayPath": "a.txt", "kind": "untracked", "added": 3 }],
+            "totalFileCount": "4", "added": "10", "removed": "2",
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary.base_ref.as_deref(), Some("origin/main"));
+    assert_eq!(summary.files[0].kind, ChangeKind::Untracked);
+    assert_eq!(summary.files[0].as_entry().path, A);
+    assert_eq!(
+        (summary.total_file_count, summary.added, summary.removed),
+        (4, 10, 2)
+    );
+    let none =
+        model::response_branch_summary(model::response(json!({ "branchSummary": {} })).unwrap())
+            .unwrap();
+    assert_eq!(none, BranchSummary::default());
+    assert!(
+        model::response_branch_summary(
+            model::response(json!({ "branchSummary": { "files": [{ "path": "not base64!" }] } }))
+                .unwrap()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn shows_every_file_and_side_in_one_reused_tab() {
+    let mut state = PersistedAppState::default();
+    let status = parse(status_in(
+        "repo",
+        1,
+        vec![
+            entry(A, "a.txt", "modified", "modified"),
+            entry(B, "dir/b.txt", "none", "modified"),
+        ],
+    ));
+    let mut ids = ["only", "unused", "unused"].into_iter();
+    let mut open = |state: &mut PersistedAppState, entry: &StatusEntry, target| {
+        open_git_diff_tab(state, &place(), entry, target, &status, true, || {
+            ids.next().unwrap().into()
+        })
+    };
+    let (a, b) = (status.entries[0].clone(), status.entries[1].clone());
+    assert_eq!(open(&mut state, &a, Target::Unstaged), "only");
+    assert_eq!(open(&mut state, &b, Target::Unstaged), "only");
+    assert_eq!(state.app_tabs[0].git_path.as_deref(), Some(B));
+    assert_eq!(state.app_tabs[0].title, "b.txt (unstaged)");
+    assert_eq!(open(&mut state, &a, Target::Staged), "only");
+    assert_eq!(open(&mut state, &a, Target::Base), "only");
+    assert_eq!(state.app_tabs[0].git_target, Some(Target::Base));
+    assert_eq!(state.app_tabs[0].title, "a.txt (branch)");
+    assert_eq!(state.app_tabs.len(), 1);
+}
+
+fn with_hunks(command: &GitCommand) -> Option<Result<Value, String>> {
+    Some(Ok(match command.operation.as_str() {
+        "diff" => {
+            let mut response = diff_response("repo", b"a.txt", 1);
+            response["diff"]["target"] = json!(command.diff_target);
+            response["diff"]["hunkCount"] = json!(2);
+            response["diff"]["patch"] = json!(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                TWO_HUNKS
+            ));
+            response
+        }
+        "mutate" => applied(2),
+        _ => json!({ "status": status(1) }),
+    }))
+}
+
+#[gpui_kit::test]
+fn draws_the_hunks_and_stages_the_one_asked_for(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, with_hunks);
+    let view = diff_view(&panel, "repo", cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.hunk_headers()),
+        ["@@ -1,3 +1,3 @@ fn first", "@@ -10,2 +10,3 @@"]
+    );
+    assert!(view.update(cx, |view, cx| view.collapse_all(true, cx)));
+    assert!(!view.update(cx, |view, cx| view.collapse_all(false, cx)));
+
+    view.update(cx, |view, cx| view.stage_hunk(1, cx));
+    cx.run_until_parked();
+    let mutate = panel.fake.requests.borrow()[2].clone();
+    assert_eq!(mutate.operation, "mutate");
+    assert_eq!(mutate.hunk_index, 1);
+
+    // The whole file is today's diff, drawn from both sides.
+    view.update(cx, |view, cx| view.show_whole_file(cx));
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |view, _| view.hunk_headers()).is_empty());
+    assert_eq!(view.read_with(cx, |view, _| view.shown()), (true, None));
+}
+
+#[gpui_kit::test]
+fn a_collapsed_hunk_stays_collapsed_after_another_is_staged(cx: &mut TestAppContext) {
+    // Once the first hunk is staged, the second is all that is left, and its
+    // `@@` line has moved.
+    let mut staged = false;
+    let panel = Panel::new(cx, move |command| {
+        let generation = if staged { 2 } else { 1 };
+        Some(Ok(match command.operation.as_str() {
+            "diff" => {
+                let mut response = diff_response("repo", b"a.txt", generation);
+                let patch = if staged {
+                    "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -11,2 +11,3 @@\n ten\n+ten and a half\n eleven\n\\ No newline at end of file\n"
+                } else {
+                    TWO_HUNKS
+                };
+                response["diff"]["patch"] = json!(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    patch
+                ));
+                response
+            }
+            "mutate" => {
+                staged = true;
+                applied(2)
+            }
+            _ => json!({ "status": status(generation) }),
+        }))
+    });
+    let view = diff_view(&panel, "repo", cx);
+    view.update(cx, |view, cx| view.collapse_hunk(1, cx));
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.collapsed_hunks(cx)),
+        [false, true]
+    );
+
+    view.update(cx, |view, cx| view.stage_hunk(0, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |view, _| view.hunk_headers()),
+        ["@@ -11,2 +11,3 @@"]
+    );
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.collapsed_hunks(cx)),
+        [true]
+    );
+}
+
+#[gpui_kit::test]
+fn reads_a_default_branch_diff_the_status_knows_nothing_about(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        let clean = json!({ "status": status_in("repo", 1, vec![]) });
+        with_hunks(command).map(|answer| {
+            answer.map(|value| {
+                if command.operation == "diff" {
+                    value
+                } else {
+                    clean.clone()
+                }
+            })
+        })
+    });
+    panel.point_at("t", 1, cx);
+    let mut tab = tab("repo");
+    tab.git_target = Some(Target::Base);
+    let owner = panel.panel.clone();
+    let view = cx.new(|cx| GitDiffView::new(owner, tab, cx));
+    cx.run_until_parked();
+    let diff = panel.fake.requests.borrow()[1].clone();
+    assert_eq!(
+        (diff.operation.as_str(), diff.diff_target.as_str()),
+        ("diff", "base")
+    );
+    assert_eq!(view.read_with(cx, |view, _| view.hunk_headers()).len(), 2);
+}
+
+#[gpui_kit::test]
+fn lists_the_default_branch_changes_only_while_that_scope_is_shown(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        Some(Ok(match command.operation.as_str() {
+            "branchSummary" => json!({ "branchSummary": {
+                "baseRef": "origin/main",
+                "files": [{ "path": A, "displayPath": "a.txt", "kind": "modified", "added": 2 }],
+                "totalFileCount": "1", "added": "2", "removed": "0",
+            }}),
+            _ => json!({ "status": status(1) }),
+        }))
+    });
+    panel.point_at("t", 1, cx);
+    assert_eq!(panel.fake.count("branchSummary"), 0);
+    panel.panel.update(cx, |panel, cx| {
+        panel.set_scope(super::panel::Scope::Branch, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(panel.fake.count("branchSummary"), 1);
+    let summary = panel
+        .panel
+        .read_with(cx, |panel, _| panel.summary(SummaryBase::DefaultBranch));
+    assert_eq!(summary.unwrap().files[0].display_path, "a.txt");
+
+    // A status that moved reads it again; one that did not, does not.
+    let watch_id = panel.fake.requests.borrow()[0].watch_id.clone();
+    for generation in [1, 2] {
+        panel.store.update(cx, |store, cx| {
+            store.handle_event(watch_event(&watch_id, "t", generation), cx)
+        });
+        cx.run_until_parked();
+    }
+    assert_eq!(panel.fake.count("branchSummary"), 2);
+}
+
+#[gpui_kit::test]
+fn reads_both_summaries_while_a_reader_wants_them(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        Some(Ok(match command.operation.as_str() {
+            "branchSummary" if command.summary_base == "head" => {
+                json!({ "branchSummary": { "baseRef": "HEAD",
+                "totalFileCount": "1", "added": "1", "removed": "0" } })
+            }
+            "branchSummary" => json!({ "branchSummary": { "baseRef": "origin/main",
+                "totalFileCount": "0", "added": "3", "removed": "1" } }),
+            _ => json!({ "status": status(1) }),
+        }))
+    });
+    let bases = || -> Vec<String> {
+        panel
+            .fake
+            .requests
+            .borrow()
+            .iter()
+            .filter(|command| command.operation == "branchSummary")
+            .map(|command| command.summary_base.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+    panel.point_at("t", 1, cx);
+    panel
+        .panel
+        .update(cx, |panel, cx| panel.read_summaries(true, cx));
+    cx.run_until_parked();
+    // Read once the status has rested.
+    assert!(bases().is_empty());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(1100));
+    cx.run_until_parked();
+    assert_eq!(bases(), ["", "head"]);
+    let summary = |base| panel.panel.read_with(cx, |panel, _| panel.summary(base));
+    assert_eq!(summary(SummaryBase::DefaultBranch).unwrap().added, 3);
+    let uncommitted = summary(SummaryBase::Head).unwrap();
+    assert_eq!(uncommitted.base_ref.as_deref(), Some("HEAD"));
+    assert_eq!(uncommitted.added, 1);
+
+    // With no reader left and the uncommitted list shown, a moved status
+    // reads nothing.
+    panel
+        .panel
+        .update(cx, |panel, cx| panel.read_summaries(false, cx));
+    let watch_id = panel.fake.requests.borrow()[0].watch_id.clone();
+    panel.store.update(cx, |store, cx| {
+        store.handle_event(watch_event(&watch_id, "t", 2), cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(1100));
+    cx.run_until_parked();
+    assert_eq!(panel.fake.count("branchSummary"), 2);
+}
+
+#[gpui_kit::test]
+fn the_branch_scope_alone_reads_only_the_default_branch_summary(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        Some(Ok(match command.operation.as_str() {
+            "branchSummary" => json!({ "branchSummary": { "baseRef": "origin/main",
+                "totalFileCount": "0", "added": "0", "removed": "0" } }),
+            _ => json!({ "status": status(1) }),
+        }))
+    });
+    panel.point_at("t", 1, cx);
+    panel.panel.update(cx, |panel, cx| {
+        panel.set_scope(super::panel::Scope::Branch, cx)
+    });
+    cx.run_until_parked();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(1100));
+    cx.run_until_parked();
+    let asked: Vec<String> = panel
+        .fake
+        .requests
+        .borrow()
+        .iter()
+        .filter(|command| command.operation == "branchSummary")
+        .map(|command| command.summary_base.clone())
+        .collect();
+    assert_eq!(asked, [""]);
+    assert!(
+        panel
+            .panel
+            .read_with(cx, |panel, _| panel.summary(SummaryBase::Head))
+            .is_none()
+    );
+}
+
+#[gpui_kit::test]
+fn lists_branches_and_switches_once_against_the_status_on_screen(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, |command| {
+        Some(Ok(match command.operation.as_str() {
+            "branches" => json!({ "branches": {
+                "branches": ["main", "feature"], "current": "main", "truncated": false,
+            }}),
+            "checkout" => applied(2),
+            _ => json!({ "status": status(1) }),
+        }))
+    });
+    panel.point_at("t", 1, cx);
+    let read = panel
+        .panel
+        .read_with(cx, |panel, cx| panel.branches(cx))
+        .unwrap();
+    let branches = block_on(read).unwrap();
+    assert_eq!(branches.names, ["main", "feature"]);
+    assert_eq!(branches.current.as_deref(), Some("main"));
+    let sent = panel.fake.requests.borrow().last().unwrap().clone();
+    assert_eq!(
+        (sent.operation.as_str(), sent.repository_id.as_str()),
+        ("branches", "repo")
+    );
+
+    let switching = panel
+        .panel
+        .update(cx, |panel, cx| panel.checkout("feature".into(), cx))
+        .unwrap();
+    cx.run_until_parked();
+    let result = block_on(switching).unwrap();
+    assert!(result.applied());
+    assert_eq!(panel.fake.count("checkout"), 1);
+    let sent = panel.fake.requests.borrow().last().unwrap().clone();
+    assert_eq!(sent.branch, "feature");
+    assert_eq!(sent.expected_status_generation, "1");
+    // The status the switch left is the one the panel now shows.
+    let generation = panel
+        .panel
+        .read_with(cx, |panel, cx| panel.status(cx).unwrap().generation);
+    assert_eq!(generation, 2);
+}
+
+#[gpui_kit::test]
+fn switches_no_branch_while_git_cannot_be_written_to(cx: &mut TestAppContext) {
+    let panel = Panel::new(cx, answering);
+    let context = PanelContext::new(Some(root("t")), live(1), false);
+    panel
+        .panel
+        .update(cx, |panel, cx| panel.set_context(context, cx));
+    cx.run_until_parked();
+    let switching = panel
+        .panel
+        .update(cx, |panel, cx| panel.checkout("feature".into(), cx));
+    assert!(switching.is_none());
+    assert_eq!(panel.fake.count("checkout"), 0);
+}
+
+#[test]
+fn a_branch_list_without_a_current_branch_is_a_detached_head() {
+    let branches = model::response_branches(
+        model::response(json!({ "branches": { "branches": ["main"], "truncated": true } }))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(branches.current, None);
+    assert!(branches.truncated);
+    assert!(model::response_branches(model::response(json!({})).unwrap()).is_err());
+}

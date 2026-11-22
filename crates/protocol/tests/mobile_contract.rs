@@ -7,6 +7,22 @@ use tmux_agent_protocol::{
     validate_host_contract,
 };
 
+/// A workspace build can turn on `serde_json/preserve_order` through another
+/// crate, and the generated files must not depend on that.
+fn sort_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: std::collections::BTreeMap<_, _> = map
+                .into_iter()
+                .map(|(key, item)| (key, sort_keys(item)))
+                .collect();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_keys).collect()),
+        other => other,
+    }
+}
+
 fn admission(major: u32) -> Value {
     let refusal = match validate_host_contract(major) {
         Ok(()) => Value::Null,
@@ -67,6 +83,14 @@ fn mobile_contract_matches_rust() {
                     }), ..Default::default()
                 }), ..Default::default()
             })),
+            "chat": frame(v1::envelope::Payload::Event(v1::HostEvent {
+                kind: v1::EventKind::Chat.into(), scope: "%3".into(), chat: Some(v1::ChatEvent {
+                    pane_id: "%3".into(), revision: (1 << 53) + 3,
+                    change: Some(v1::chat_event::Change::Delta(v1::ChatItemDelta {
+                        item_id: "a1".into(), text_append: "h\u{e9}llo".into(),
+                    })),
+                }), ..Default::default()
+            })),
         },
     });
     for (file, value) in [
@@ -76,7 +100,10 @@ fn mobile_contract_matches_rust() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../apps/mobile/src/protocol")
             .join(file);
-        let generated = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
+        let generated = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&sort_keys(value)).unwrap()
+        );
         if std::env::var_os("MUXFLOW_UPDATE_CONTRACT").is_some() {
             std::fs::write(&path, &generated).unwrap();
         }
