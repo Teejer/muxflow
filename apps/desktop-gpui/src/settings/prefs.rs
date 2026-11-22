@@ -46,6 +46,9 @@ pub struct Prefs {
     /// tiling-desktop bare windows never move; only Muxflow's own buttons do.
     pub window_buttons_side: WindowButtonsSide,
     pub compact_workspaces: bool,
+    /// Reopen the remembered workspaces when a host's tmux server comes back
+    /// without them. Off until asked, and turning it off discards the record.
+    pub restore_workspaces: bool,
     pub agent_state_glyphs: bool,
     pub markdown_appearance: MarkdownAppearance,
     pub default_markdown_view: AppTabViewMode,
@@ -104,6 +107,7 @@ impl Prefs {
             tabs_in_title_bar: shell.tabs_in_title_bar.unwrap_or(true),
             window_buttons_side: shell.window_buttons_side.unwrap_or(WindowButtonsSide::Left),
             compact_workspaces: shell.compact_workspaces.unwrap_or(true),
+            restore_workspaces: shell.restore_workspaces,
             agent_state_glyphs: shell.agent_state_glyphs,
             markdown_appearance: shell
                 .markdown_appearance
@@ -158,6 +162,7 @@ impl Prefs {
         shell.tabs_in_title_bar = Some(self.tabs_in_title_bar);
         shell.window_buttons_side = Some(self.window_buttons_side);
         shell.compact_workspaces = Some(self.compact_workspaces);
+        shell.restore_workspaces = self.restore_workspaces;
         shell.agent_state_glyphs = self.agent_state_glyphs;
         shell.markdown_appearance = Some(self.markdown_appearance);
         shell.default_markdown_view = Some(self.default_markdown_view);
@@ -243,6 +248,7 @@ mod tests {
                 tabs_in_title_bar: true,
                 window_buttons_side: WindowButtonsSide::Left,
                 compact_workspaces: true,
+                restore_workspaces: false,
                 agent_state_glyphs: false,
                 markdown_appearance: MarkdownAppearance::Default,
                 default_markdown_view: AppTabViewMode::Split,
@@ -270,6 +276,7 @@ mod tests {
             "tabsInTitleBar": false,
             "windowButtonsSide": "right",
             "compactWorkspaces": false,
+            "restoreWorkspaces": true,
             "agentStateGlyphs": true,
             "markdownAppearance": "dark",
             "defaultMarkdownView": "source",
@@ -284,6 +291,7 @@ mod tests {
         assert_eq!(prefs.window_buttons_side, WindowButtonsSide::Right);
         assert!(prefs.focus_follows_mouse && prefs.agent_state_glyphs);
         assert!(!prefs.compact_workspaces);
+        assert!(prefs.restore_workspaces);
         assert_eq!(prefs.markdown_appearance, MarkdownAppearance::Dark);
         assert_eq!(prefs.default_markdown_view, AppTabViewMode::Source);
         assert!(prefs.enabled_panel_extensions.is_empty());
