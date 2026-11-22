@@ -4587,6 +4587,7 @@ dependencies = [
  "terminal-interactions",
  "tmux-control",
  "tokio",
+ "ureq",
  "uuid",
 ]
 

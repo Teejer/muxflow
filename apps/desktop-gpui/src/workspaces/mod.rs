@@ -846,10 +846,10 @@ impl Workspaces {
                         .find(|session| session.name == name)
                         .map(|session| session.id.clone())
                         .or_else(|| created.get(&name).cloned());
-                    if let Some(session_id) = found {
-                        if link.active_session_id.as_deref() != Some(session_id.as_str()) {
-                            this.select_session(&session_id, cx);
-                        }
+                    if let Some(session_id) = found
+                        && link.active_session_id.as_deref() != Some(session_id.as_str())
+                    {
+                        this.select_session(&session_id, cx);
                     }
                 });
             }

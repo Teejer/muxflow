@@ -18,6 +18,8 @@ pub const UI_SCALES: [f64; 5] = [0.9, 1.0, 1.1, 1.2, 1.3];
 /// The panel extensions a build has, by id. Adding one is an entry here and in
 /// the Workspace tab's list.
 pub const AUTOMATIONS_EXTENSION: &str = "automations";
+/// The right panel's AI segment, off until asked for like every extension.
+pub const AI_EXTENSION: &str = "ai";
 /// The longest a workspace default may be, in characters. The store refuses a
 /// whole save over one field above 16 KiB, so a long paste is bounded here and
 /// cannot stop everything else from persisting.
@@ -49,6 +51,11 @@ pub struct Prefs {
     /// Reopen the remembered workspaces when a host's tmux server comes back
     /// without them. Off until asked, and turning it off discards the record.
     pub restore_workspaces: bool,
+    /// Settings → Assistant: the OpenAI-compatible endpoint the AI tab calls,
+    /// the model to ask, and the key it answers with when one is needed.
+    pub ai_base_url: String,
+    pub ai_model: String,
+    pub ai_api_key: String,
     pub agent_state_glyphs: bool,
     pub markdown_appearance: MarkdownAppearance,
     pub default_markdown_view: AppTabViewMode,
@@ -108,6 +115,9 @@ impl Prefs {
             window_buttons_side: shell.window_buttons_side.unwrap_or(WindowButtonsSide::Left),
             compact_workspaces: shell.compact_workspaces.unwrap_or(true),
             restore_workspaces: shell.restore_workspaces,
+            ai_base_url: shell.ai_base_url.clone(),
+            ai_model: shell.ai_model.clone(),
+            ai_api_key: shell.ai_api_key.clone(),
             agent_state_glyphs: shell.agent_state_glyphs,
             markdown_appearance: shell
                 .markdown_appearance
@@ -163,6 +173,9 @@ impl Prefs {
         shell.window_buttons_side = Some(self.window_buttons_side);
         shell.compact_workspaces = Some(self.compact_workspaces);
         shell.restore_workspaces = self.restore_workspaces;
+        shell.ai_base_url = self.ai_base_url.clone();
+        shell.ai_model = self.ai_model.clone();
+        shell.ai_api_key = self.ai_api_key.clone();
         shell.agent_state_glyphs = self.agent_state_glyphs;
         shell.markdown_appearance = Some(self.markdown_appearance);
         shell.default_markdown_view = Some(self.default_markdown_view);
@@ -249,6 +262,9 @@ mod tests {
                 window_buttons_side: WindowButtonsSide::Left,
                 compact_workspaces: true,
                 restore_workspaces: false,
+                ai_base_url: String::new(),
+                ai_model: String::new(),
+                ai_api_key: String::new(),
                 agent_state_glyphs: false,
                 markdown_appearance: MarkdownAppearance::Default,
                 default_markdown_view: AppTabViewMode::Split,
@@ -277,6 +293,9 @@ mod tests {
             "windowButtonsSide": "right",
             "compactWorkspaces": false,
             "restoreWorkspaces": true,
+            "aiBaseUrl": "http://127.0.0.1:11434/v1",
+            "aiModel": "qwen2.5-coder",
+            "aiApiKey": "secret",
             "agentStateGlyphs": true,
             "markdownAppearance": "dark",
             "defaultMarkdownView": "source",
@@ -292,6 +311,9 @@ mod tests {
         assert!(prefs.focus_follows_mouse && prefs.agent_state_glyphs);
         assert!(!prefs.compact_workspaces);
         assert!(prefs.restore_workspaces);
+        assert_eq!(prefs.ai_base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(prefs.ai_model, "qwen2.5-coder");
+        assert_eq!(prefs.ai_api_key, "secret");
         assert_eq!(prefs.markdown_appearance, MarkdownAppearance::Dark);
         assert_eq!(prefs.default_markdown_view, AppTabViewMode::Source);
         assert!(prefs.enabled_panel_extensions.is_empty());
