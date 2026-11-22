@@ -5,7 +5,9 @@
 use std::rc::Rc;
 
 use desktop_core::{
-    app_state::{AgentSoundMode, AppTabViewMode, MarkdownAppearance, ThemePreference},
+    app_state::{
+        AgentSoundMode, AppTabViewMode, MarkdownAppearance, ThemePreference, WindowButtonsSide,
+    },
     notifications::{emit_test_notification, notification_permission_status},
 };
 use gpui_kit::{
@@ -95,6 +97,11 @@ const MARKDOWN_APPEARANCES: [(MarkdownAppearance, &str); 3] = [
     (MarkdownAppearance::Default, "Muxflow default"),
     (MarkdownAppearance::Light, "Light"),
     (MarkdownAppearance::Dark, "Dark"),
+];
+
+const WINDOW_BUTTON_SIDES: [(WindowButtonsSide, &str); 2] = [
+    (WindowButtonsSide::Left, "Left, macOS style"),
+    (WindowButtonsSide::Right, "Right, Windows style"),
 ];
 
 const MARKDOWN_VIEWS: [(AppTabViewMode, &str); 4] = [
@@ -1060,6 +1067,24 @@ impl SettingsDialog {
                 |on, window, cx| update(|prefs| prefs.tabs_in_title_bar = on, window, cx),
                 cx,
             ))
+            .child(
+                v_flex()
+                    .gap(ui(5.))
+                    .child(legend("Window buttons", cx))
+                    .child(radios(
+                        "settings-window-buttons-side",
+                        "Window buttons",
+                        &WINDOW_BUTTON_SIDES,
+                        prefs.window_buttons_side,
+                        |side, window, cx| {
+                            update(|prefs| prefs.window_buttons_side = side, window, cx);
+                        },
+                    ))
+                    .child(hint(
+                        "Which end minimize, maximize and close sit on, and in which order. Only Muxflow's own buttons move: macOS draws its traffic lights itself, and tiling window managers get no buttons at all.",
+                        cx,
+                    )),
+            )
             .child(
                 v_flex()
                     .gap(ui(5.))
