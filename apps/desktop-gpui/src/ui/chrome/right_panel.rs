@@ -92,97 +92,86 @@ impl RenderOnce for RightPanel {
             .border_l_1()
             .border_color(palette.chrome_hairline)
             .child(
-                // The bar's own scroll box. The segments outgrow a narrow
-                // panel at high text scales or with many extensions, and
-                // nothing in this chrome clips: the scroll lives on a plain
-                // div, as the tab strip does, because the segment row below
-                // sizes to its content and paints past whatever box merely
-                // contains it.
-                div()
-                    .id("panel-tabs-bar")
-                    .w_full()
+                Tabs::new("panel-tabs")
+                    .aria_label("Panel surface")
+                    .aria_size_of_set(tab_count)
+                    .track_focus(&focus)
+                    .flex()
+                    .items_stretch()
+                    .h(ui(BAR_HEIGHT))
                     .flex_none()
-                    .min_w_0()
-                    .overflow_x_scroll()
+                    .px(ui(6.))
                     .border_b_1()
                     .border_color(palette.chrome_hairline)
-                    .child(
-                        Tabs::new("panel-tabs")
-                            .aria_label("Panel surface")
-                            .aria_size_of_set(tab_count)
-                            .track_focus(&focus)
-                            .flex()
-                            .items_stretch()
-                            .h(ui(BAR_HEIGHT))
-                            .flex_none()
-                            .px(ui(6.))
-                            .children(self.surfaces.iter().enumerate().map(
-                                |(index, (id, label))| {
-                                    let selected = *id == self.surface;
-                                    let chrome = self.chrome.clone();
-                                    let surface = id.clone();
-                                    let (keys, ids) = (self.chrome.clone(), ids.clone());
-                                    Tab::new(format!("panel-tab-{id}"))
-                                        .selected(selected)
-                                        .accessibility_label(label.clone())
-                                        // AccessKit counts from zero.
-                                        .set_position(index, tab_count)
-                                        // Kit moves the keyboard; the segment
-                                        // it moves to is shown.
-                                        .on_key_down(move |event: &KeyDownEvent, _, cx| {
-                                            let next = crate::ui::kit_tab_step(
-                                                index,
-                                                ids.len(),
-                                                event,
-                                                |_| true,
-                                            );
-                                            if let Some(surface) = next.map(|next| &ids[next]) {
-                                                keys.update(cx, |chrome, cx| {
-                                                    chrome.show_surface(surface, cx)
-                                                })
-                                                .ok();
-                                            }
-                                        })
-                                        .on_click(move |_, _, cx| {
-                                            chrome
-                                                .update(cx, |chrome, cx| {
-                                                    chrome.show_surface(&surface, cx)
-                                                })
-                                                .ok();
-                                        })
-                                        .relative()
-                                        .px(ui(11.))
-                                        .text_size(ui(TYPE_TITLEBAR))
-                                        .text_color(if selected {
-                                            palette.chrome_ink_strong
-                                        } else {
-                                            palette.chrome_dim
-                                        })
-                                        .child(label.clone())
-                                        .when(selected && held && keyboard, |tab| {
-                                            tab.child(
-                                                div()
-                                                    .absolute()
-                                                    .inset_0()
-                                                    .border_2()
-                                                    .border_color(palette.accent)
-                                                    .rounded(ui(4.)),
-                                            )
-                                        })
-                                        .when(selected, |tab| {
-                                            tab.child(
-                                                div()
-                                                    .absolute()
-                                                    .left(ui(6.))
-                                                    .right(ui(6.))
-                                                    .bottom_0()
-                                                    .h(ui(2.))
-                                                    .rounded_t(ui(1.))
-                                                    .bg(palette.accent),
-                                            )
-                                        })
-                                },
-                            )),
+                    .children(
+                        self.surfaces
+                            .iter()
+                            .enumerate()
+                            .map(|(index, (id, label))| {
+                                let selected = *id == self.surface;
+                                let chrome = self.chrome.clone();
+                                let surface = id.clone();
+                                let (keys, ids) = (self.chrome.clone(), ids.clone());
+                                Tab::new(format!("panel-tab-{id}"))
+                                    .selected(selected)
+                                    .accessibility_label(label.clone())
+                                    // AccessKit counts from zero.
+                                    .set_position(index, tab_count)
+                                    // Kit moves the keyboard; the segment
+                                    // it moves to is shown.
+                                    .on_key_down(move |event: &KeyDownEvent, _, cx| {
+                                        let next = crate::ui::kit_tab_step(
+                                            index,
+                                            ids.len(),
+                                            event,
+                                            |_| true,
+                                        );
+                                        if let Some(surface) = next.map(|next| &ids[next]) {
+                                            keys.update(cx, |chrome, cx| {
+                                                chrome.show_surface(surface, cx)
+                                            })
+                                            .ok();
+                                        }
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        chrome
+                                            .update(cx, |chrome, cx| {
+                                                chrome.show_surface(&surface, cx)
+                                            })
+                                            .ok();
+                                    })
+                                    .relative()
+                                    .px(ui(11.))
+                                    .text_size(ui(TYPE_TITLEBAR))
+                                    .text_color(if selected {
+                                        palette.chrome_ink_strong
+                                    } else {
+                                        palette.chrome_dim
+                                    })
+                                    .child(label.clone())
+                                    .when(selected && held && keyboard, |tab| {
+                                        tab.child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .border_2()
+                                                .border_color(palette.accent)
+                                                .rounded(ui(4.)),
+                                        )
+                                    })
+                                    .when(selected, |tab| {
+                                        tab.child(
+                                            div()
+                                                .absolute()
+                                                .left(ui(6.))
+                                                .right(ui(6.))
+                                                .bottom_0()
+                                                .h(ui(2.))
+                                                .rounded_t(ui(1.))
+                                                .bg(palette.accent),
+                                        )
+                                    })
+                            }),
                     ),
             )
             .child(
