@@ -400,6 +400,8 @@ struct HostState {
     /// Every upload and preflight started, in order.
     uploads: Vec<Uploaded>,
     cancelled_uploads: Vec<String>,
+    /// Every incident recorded, as its kind and detail.
+    incidents: Vec<(String, Value)>,
     /// Every tmux action asked for, in order.
     actions: Vec<Value>,
 }
@@ -554,7 +556,9 @@ impl TerminalBackend for FakeHost {
         Ok(())
     }
 
-    fn record_incident(&self, _: &str, _: Value) {}
+    fn record_incident(&self, kind: &str, detail: Value) {
+        self.state().incidents.push((kind.to_owned(), detail));
+    }
 
     fn set_terminal_colors(&self, _: String, _: String) -> Result<(), String> {
         Ok(())
@@ -2505,6 +2509,126 @@ fn a_chat_come_back_to_is_as_it_was_left_and_not_opened_again(cx: &mut TestAppCo
 }
 
 #[gpui_kit::test]
+fn scrolling_up_does_not_skip_markdown_parsed_in_the_overdraw(cx: &mut TestAppContext) {
+    let mut shell = shell(cx);
+    let earlier = "An earlier paragraph with enough words to need background Markdown parsing.\n\n"
+        .repeat(100);
+    let tail = "Tail paragraph.\n\n".repeat(28);
+    assert!(earlier.len() > 4096);
+    shell.chat(snapshot(
+        10,
+        vec![
+            item("u1", ChatItemKind::User, "Investigate the scrolling."),
+            item("earlier", ChatItemKind::Assistant, &earlier),
+            item("tail", ChatItemKind::Assistant, &tail),
+        ],
+        "",
+    ));
+    // The earlier row was first measured in the leading overdraw, before
+    // its background parse completed. Give that parse time to land.
+    shell.settle();
+    let pane = shell.pane();
+    let top = |shell: &mut Shell| {
+        shell
+            .visual
+            .update(|_, cx| pane.read(cx).list.read(cx).logical_scroll_top())
+    };
+    assert_eq!(top(&mut shell).item_ix, 3, "starts within the tail");
+    for _ in 0..30 {
+        shell.visual.update(|window, cx| {
+            window.scroll(
+                "chat-item-tail",
+                ScrollDelta::Pixels(point(px(0.), px(52.))),
+                cx,
+            );
+        });
+        shell.settle();
+        let at = top(&mut shell);
+        if at.item_ix < 3 {
+            assert_eq!(
+                at.item_ix, 2,
+                "a small scroll must enter the earlier answer"
+            );
+            assert!(at.offset_in_item > px(0.), "enters near its bottom");
+            return;
+        }
+    }
+    panic!("never reached the earlier answer");
+}
+
+#[gpui_kit::test]
+fn parsed_chat_text_survives_virtualization_and_resync_but_not_truncation(cx: &mut TestAppContext) {
+    let mut shell = shell(cx);
+    let earlier = "An earlier paragraph that is parsed in the background.\n\n".repeat(100);
+    let mut items = vec![
+        item("u1", ChatItemKind::User, "Investigate the scrolling."),
+        item("earlier", ChatItemKind::Assistant, &earlier),
+    ];
+    items.extend((0..40).map(|number| {
+        item(
+            &format!("u{number}-later"),
+            ChatItemKind::User,
+            "A later message that puts the earlier answer well outside the viewport.",
+        )
+    }));
+    shell.chat(snapshot(10, items.clone(), ""));
+    let pane = shell.pane();
+    let show_earlier = |shell: &mut Shell| {
+        shell.visual.update(|_, cx| {
+            pane.read(cx)
+                .list
+                .clone()
+                .update(cx, |list, cx| list.scroll_to_item(2, cx));
+        });
+        shell.settle();
+    };
+    show_earlier(&mut shell);
+    shell.settle();
+    let text = shell
+        .visual
+        .update(|_, cx| pane.update(cx, |pane, cx| pane.text_state(1, cx)));
+    shell.visual.update(|_, cx| {
+        assert_eq!(text.read(cx).rendered_text().source(), earlier);
+        pane.read(cx)
+            .list
+            .clone()
+            .update(cx, |list, cx| list.scroll_to_end(cx));
+    });
+    shell.settle();
+    assert!(!shell.shows("chat-item-earlier"));
+    show_earlier(&mut shell);
+    shell.visual.update(|_, cx| {
+        assert_eq!(pane.update(cx, |pane, cx| pane.text_state(1, cx)), text);
+        assert_eq!(text.read(cx).rendered_text().source(), earlier);
+    });
+
+    // A reconnect keeps the parsed view, even when the snapshot changes its
+    // source. A rewind that removes the item releases it instead.
+    let replacement = "A replaced answer after reconnecting.\n\n".repeat(150);
+    items[1].text = replacement.clone();
+    shell.chat(snapshot(20, items, ""));
+    show_earlier(&mut shell);
+    shell.settle();
+    shell.visual.update(|_, cx| {
+        assert_eq!(pane.update(cx, |pane, cx| pane.text_state(1, cx)), text);
+        assert_eq!(text.read(cx).rendered_text().source(), replacement);
+    });
+    shell.chat(event(
+        21,
+        ChatChange::Truncate(ChatTruncate {
+            after_item_id: "u1".into(),
+        }),
+    ));
+    shell.chat(event(
+        22,
+        ChatChange::Item(item("earlier", ChatItemKind::Assistant, "A new answer.")),
+    ));
+    shell.visual.update(|_, cx| {
+        assert_ne!(pane.update(cx, |pane, cx| pane.text_state(1, cx)), text);
+    });
+}
+
+#[gpui_kit::test]
 fn a_chat_come_back_to_keeps_its_place(cx: &mut TestAppContext) {
     let mut shell = shell(cx);
     shell.publish(vec![two_windows(2)]);
@@ -3855,6 +3979,19 @@ mod attachments {
             "muxflow-gpui.log, upload failed: disk full"
         );
         assert!(shell.shows("chat-attachment-retry-1"));
+        // Why it failed is kept where a bug report can find it.
+        let failures: Vec<Value> = shell
+            .host
+            .state()
+            .incidents
+            .iter()
+            .filter(|(kind, _)| kind == "chat.uploadFailed")
+            .map(|(_, detail)| detail.clone())
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["error"], "disk full");
+        assert_eq!(failures[0]["name"], "muxflow-gpui.log");
+        assert!(failures[0]["transferId"].is_string());
         shell.input("The log from the crash is attached.");
         shell.press("enter");
         assert_eq!(shell.host.count(ChatAction::Send), 0);
