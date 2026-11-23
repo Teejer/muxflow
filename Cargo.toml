@@ -3,6 +3,7 @@ members = [
   "apps/desktop-gpui",
   "apps/host",
   "crates/desktop-core",
+  "crates/host-assistant-phone-proxy",
   "crates/protocol",
   "crates/terminal-interactions",
   "crates/tmux-control",

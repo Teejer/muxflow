@@ -14,11 +14,13 @@
 //! without the user pressing Allow.
 
 pub mod context;
-pub mod engine;
 mod panel;
 mod store;
-mod tools;
 mod view;
+
+// The engine and the tool contract live in their own crate now, so a host can
+// run a conversation for a thin client without pulling the desktop along.
+pub use host_assistant_phone_proxy::{engine, tools};
 
 use gpui_kit::{App, AppContext, Entity, Global, IntoElement, div};
 

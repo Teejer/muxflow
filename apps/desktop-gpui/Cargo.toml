@@ -24,6 +24,7 @@ perf-log = ["desktop-core/perf-log"]
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 desktop-core = { path = "../../crates/desktop-core" }
+host-assistant-phone-proxy = { path = "../../crates/host-assistant-phone-proxy" }
 dirs = "6"
 futures = "0.3"
 # Exact pin: gpui-kit pins the matching gpui-pre snapshot (0.3.12). `gpui-fast`

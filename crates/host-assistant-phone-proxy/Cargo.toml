@@ -1,0 +1,17 @@
+[package]
+name = "host-assistant-phone-proxy"
+version = "0.1.0"
+license = "MIT"
+description = "The assistant engine and its tool contract, shared by the desktop panel and, next, by any thin client (the phone) that asks the host to run the conversation."
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+desktop-core = { path = "../desktop-core" }
+tmux-control = { path = "../tmux-control" }
+futures = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+ureq = "3"
+uuid.workspace = true
