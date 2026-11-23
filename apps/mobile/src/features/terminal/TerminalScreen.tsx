@@ -1,12 +1,13 @@
 import { useFocusEffect, useRouter } from "expo-router";
 import * as Clipboard from "expo-clipboard";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Keyboard, Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { Keyboard, Linking, Pressable, StyleSheet, Text, TextInput, View, type TextInputInstance } from "react-native";
 import Animated, { KeyboardState, useAnimatedKeyboard, useAnimatedReaction, useAnimatedStyle, useSharedValue } from "react-native-reanimated";
 import { runOnJS } from "react-native-worklets";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import type { ChatCommand } from "../../protocol/gen/chat_pb";
+import { isCodexAdapter } from "../agents/agentIconPaths";
 import { agentForPane, agentStateWord, agentTitle } from "../agents/agentViews";
 import { stripAgentStatusGlyphs } from "../agents/agentLabels";
 import { markState } from "../agents/agentListModel";
@@ -29,6 +30,7 @@ import { ConnectionStrip } from "../hosts/ConnectionStrip";
 import { FolderIcon } from "../../ui/components/MediaIcons";
 import { externalLinkTarget } from "../../ui/externalLinks";
 import { useSession } from "../../ui/hooks";
+import { lightColors } from "@muxflow/client-core";
 import { colors, radii, typeScale } from "../../ui/tokens";
 import { displayMessageFor } from "../files/errors";
 import { filesStore } from "../files/filesStore";
@@ -77,16 +79,16 @@ function logKeyboardState(paneId: string, event: "focus" | "blur" | "state", sta
 export function TerminalScreen({ paneId, sessionId, startInVoice }: TerminalScreenProps) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  // Expo SDK 57 is edge-to-edge on Android, where adjustResize no longer
+  // Expo is edge-to-edge on Android, where adjustResize no longer
   // shrinks the window and RN's Keyboard events under-report the height.
   // Reanimated reads the IME inset itself; padding by it keeps the chips and
   // input bar visible and shrinks the WebView, which re-measures and sends
   // RESIZE_TERMINAL (§7.6 step 6).
-  const keyboard = useAnimatedKeyboard({ isStatusBarTranslucentAndroid: true, isNavigationBarTranslucentAndroid: true });
+  const keyboard = useAnimatedKeyboard();
   const inputFocused = useSharedValue(false);
   const keyboardPadding = useAnimatedStyle(() => ({
     paddingBottom: terminalKeyboardInset(insets.bottom, keyboard.height.value, inputFocused.value),
-  }), [insets.bottom]);
+  }));
   // Observe lifecycle edges only. The reaction reads just `state`, so there is
   // no work during the per-frame height animation and at most four JS log
   // calls per open/close cycle.
@@ -95,7 +97,6 @@ export function TerminalScreen({ paneId, sessionId, startInVoice }: TerminalScre
     (state, previous) => {
       if (state !== previous) runOnJS(logKeyboardState)(paneId, "state", state, keyboard.height.value);
     },
-    [paneId],
   );
   useFocusEffect(useCallback(() => {
     logKeyboardState(paneId, "focus", keyboard.state.value, keyboard.height.value);
@@ -137,7 +138,9 @@ export function TerminalScreen({ paneId, sessionId, startInVoice }: TerminalScre
   const files = useAttachments(paneId, attachDeps);
   const [attaching, setAttaching] = useState(false);
   const catalog = useTerminalCommands(paneId, state.serverIdentity, agentPresent ? `${agent.adapterId}:${agent.id}` : undefined, connected);
-  const commands = useMemo(() => slashMatches(catalog, draft), [catalog, draft]);
+  // Typed into the agent as is: only Codex reads `$name` as a skill. A chat's host turns it into what its agent takes.
+  const dollarSkills = agent !== undefined && isCodexAdapter(agent.adapterId);
+  const commands = useMemo(() => slashMatches(catalog, draft, dollarSkills), [catalog, draft, dollarSkills]);
   const pickCommand = useCallback((command: ChatCommand) => setDraft((current) => withPickedCommand(current, command)), []);
 
   useFocusEffect(useCallback(() => {
@@ -338,7 +341,7 @@ export function TerminalScreen({ paneId, sessionId, startInVoice }: TerminalScre
   const voiceParts = agentPresent || voiceMode ? voice.parts : undefined;
   const voicePane = voiceMode && voiceParts?.ready === true;
   // The talk pane's keyboard button leaves voice mode for the reply field, so the field takes the focus.
-  const field = useRef<TextInput>(null);
+  const field = useRef<TextInputInstance>(null);
   const wasVoicePane = useRef(voicePane);
   useEffect(() => {
     if (wasVoicePane.current && !voiceMode) field.current?.focus();
@@ -383,7 +386,7 @@ export function TerminalScreen({ paneId, sessionId, startInVoice }: TerminalScre
           </View>
         ) : (
           <>
-            <TerminalWebView onLoadEnd={() => setPageLoaded(true)} onMessage={onPageMessage} ref={webview} />
+            <TerminalWebView onLoadEnd={() => setPageLoaded(true)} onMessage={onPageMessage} ref={webview} scheme={state.terminalScheme} />
             {snapshot.phase === "exited" ? (
               <View style={styles.banner}>
                 <Text style={styles.bannerText}>This pane has closed.</Text>
@@ -391,7 +394,8 @@ export function TerminalScreen({ paneId, sessionId, startInVoice }: TerminalScre
             ) : null}
             {snapshot.phase === "noOutput" ? (
               <View pointerEvents="none" style={styles.overlay}>
-                <Text style={styles.overlayText}>No output yet. The pane may be idle.</Text>
+                {/* Drawn over the terminal itself, so it takes the terminal's light or dark ink. */}
+                <Text style={[styles.overlayText, state.terminalScheme === "light" ? { color: lightColors.chromeDim } : null]}>No output yet. The pane may be idle.</Text>
               </View>
             ) : null}
           </>

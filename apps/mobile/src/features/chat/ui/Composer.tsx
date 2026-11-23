@@ -1,5 +1,5 @@
 import type { ReactNode, Ref } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View, type TextInputInstance } from "react-native";
 
 import type { ChatCommand } from "../../../protocol/gen/chat_pb";
 import { ArrowUpIcon } from "../../../ui/components/MediaIcons";
@@ -35,7 +35,7 @@ export interface ComposerProps {
   /** The field took the focus. */
   onFocus?: (() => void) | undefined;
   /** The field itself, for whoever has to focus it: starting an edit does. */
-  inputRef?: Ref<TextInput> | undefined;
+  inputRef?: Ref<TextInputInstance> | undefined;
   /** The mic: a tap turns voice mode on (off when `on`), a hold dictates. Absent hides it. */
   mic?: { on: boolean; onTap: () => void; dictation: ComposerDictation | undefined } | undefined;
   /** Attaching files. Absent hides the plus button: the agent takes none. */
@@ -77,7 +77,9 @@ export function Composer(props: ComposerProps) {
   const sendDisabled = disabled || sending || (blocked && !sideQuestion) || !hasMessage || filesHeld !== undefined;
   // Nothing to send yet, or not all of it on the host yet.
   const sendPlain = !hasMessage || files === "uploading";
-  const placeholder = props.placeholder ?? (blocked ? "Answer the card above" : working && canSendMidTurn ? "Send a follow-up while it works" : "Reply");
+  // Until a first dictation, the empty field says the mic can be held.
+  const replyPlaceholder = mic?.dictation && !mic.dictation.taught ? "Reply · hold the mic to dictate" : "Reply";
+  const placeholder = props.placeholder ?? (blocked ? "Answer the card above" : working && canSendMidTurn ? "Send a follow-up while it works" : replyPlaceholder);
   // A dictation is sent as Send would send it, so it waits for what Send waits for.
   const dictationRefusal = blocked && !sideQuestion ? "Answer the card above first" : working && !canSendMidTurn && !sideQuestion && !editing ? "The agent takes a message once it stops" : "";
   const dictation = mic?.dictation;

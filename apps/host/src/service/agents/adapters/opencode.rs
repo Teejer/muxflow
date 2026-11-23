@@ -24,8 +24,8 @@ pub(crate) struct OpenCodeAdapter;
 
 impl OpenCodeAdapter {
     fn render(&self, template: &str, helper_path: &Path) -> String {
-        let helper =
-            serde_json::to_string(&helper_path.to_string_lossy()).expect("a string always serializes");
+        let helper = serde_json::to_string(&helper_path.to_string_lossy())
+            .expect("a string always serializes");
         template
             .replace("__MUXFLOW_HELPER__", &helper)
             .replace("__MUXFLOW_MANAGED_OWNER__", MANAGED_OWNER)
@@ -102,8 +102,8 @@ impl AgentAdapter for OpenCodeAdapter {
     /// same flag `opencode run` exposes; `--title` names the copy so it is
     /// distinguishable from the original in the session list.
     fn branch(&self, native_session_id: &str, source_title: &str) -> LaunchSpec {
-        let source_name = crate::service::topology::agent_title_suffix(source_title)
-            .unwrap_or(source_title);
+        let source_name =
+            crate::service::topology::agent_title_suffix(source_title).unwrap_or(source_title);
         LaunchSpec {
             program: self.executable(),
             arguments: vec![
@@ -137,7 +137,10 @@ impl AgentAdapter for OpenCodeAdapter {
     fn managed_files(&self, helper_path: &Path) -> Option<Vec<(&'static str, String)>> {
         Some(vec![
             (TUI_FILE, self.render(OPENCODE_TUI_TEMPLATE, helper_path)),
-            (SERVER_FILE, self.render(OPENCODE_SERVER_TEMPLATE, helper_path)),
+            (
+                SERVER_FILE,
+                self.render(OPENCODE_SERVER_TEMPLATE, helper_path),
+            ),
         ])
     }
 }
@@ -171,7 +174,11 @@ mod tests {
 
     #[test]
     fn opencode_process_detection_is_the_native_binary() {
-        for command in ["opencode", "/usr/bin/opencode serve --service", "/a/b/opencode --session ses_1"] {
+        for command in [
+            "opencode",
+            "/usr/bin/opencode serve --service",
+            "/a/b/opencode --session ses_1",
+        ] {
             assert!(OpenCodeAdapter.identifies_process(command), "{command}");
         }
         for command in ["opencoded", "/usr/bin/open", "oc"] {
@@ -182,10 +189,19 @@ mod tests {
     #[test]
     fn opencode_resumes_by_session_and_forks_a_copy() {
         assert!(OpenCodeAdapter.launch(None).arguments.is_empty());
-        assert_eq!(OpenCodeAdapter.launch(Some("ses_1")).arguments, ["--session", "ses_1"]);
+        assert_eq!(
+            OpenCodeAdapter.launch(Some("ses_1")).arguments,
+            ["--session", "ses_1"]
+        );
         assert_eq!(
             OpenCodeAdapter.branch("ses_1", "✳ Fix tests").arguments,
-            ["--session", "ses_1", "--fork", "--title", "Fix tests (fork)"]
+            [
+                "--session",
+                "ses_1",
+                "--fork",
+                "--title",
+                "Fix tests (fork)"
+            ]
         );
     }
 
@@ -195,11 +211,7 @@ mod tests {
             .managed_files(Path::new("/opt/muxflow's/muxflow-host"))
             .unwrap();
         assert_eq!(files.len(), 2);
-        let tui = &files
-            .iter()
-            .find(|(name, _)| *name == TUI_FILE)
-            .unwrap()
-            .1;
+        let tui = &files.iter().find(|(name, _)| *name == TUI_FILE).unwrap().1;
         let server = &files
             .iter()
             .find(|(name, _)| *name == SERVER_FILE)

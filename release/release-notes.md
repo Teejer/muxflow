@@ -1,17 +1,23 @@
-## GPUI desktop
+## Stage all, discard all and Commit & Push
 
-The desktop app now uses GPUI. Existing profiles, settings and install locations
-are retained. Linux needs a working Vulkan or OpenGL graphics driver.
+The desktop's Source Control panel works more like VS Code's. Unstaged and new
+files share one Changes list, new files marked U, above Staged changes. Hover a
+group's heading to stage, unstage or discard the whole group; the command
+palette has the same three. Discard all asks once, reverts the listed files,
+deletes the new ones and keeps what is staged. None of them touches a merge
+conflict.
 
-Live Markdown table editing keeps the caret in its cell after whitespace edits.
-Enter adds a line inside a cell; Tab moves between cells. Packages include
-third-party licence notices, and the unused KDE blur dependency is removed.
-Routine success toasts for closing tabs and other visible changes are suppressed;
-download results and failure notices remain.
+Commit commits what is staged, or, when nothing is staged, every change, new
+files included; its label says which. Commit & Push and Push sit under it. An
+empty message commits as "no commit message". Committing waits until merge
+conflicts are resolved.
 
-Phones need the 0.1.33 app or newer: 0.1.33 changed the host's protocol, so
-hosts from 0.1.33 on refuse older phone apps and older hosts refuse the new app.
-Update the Android app from the APK below; the iOS build is on TestFlight.
+On the phone, the terminal uses the colors the desktop gives programs, so
+Codex's prompts stay readable when the desktop uses a light theme.
+
+Phones need the 0.1.33 app or newer, as before; this release adds to the
+protocol without changing its version. Update the Android app from the APK
+below; the iOS build is on TestFlight.
 
 ## Install
 

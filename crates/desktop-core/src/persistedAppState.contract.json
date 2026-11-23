@@ -121,7 +121,8 @@
   "workspaceDefaults": {
     "local": {
       "directory": "/work/projects",
-      "startupCommand": "git status"
+      "startupCommand": "git status",
+      "agentCommand": "codex"
     },
     "ssh-remote-linux": {
       "directory": "/srv/checkout",
