@@ -12,8 +12,9 @@ use crate::theme::metrics::{PANEL_WIDTH, SIDEBAR_WIDTH};
 
 pub const SIDEBAR_MIN_WIDTH: f32 = SIDEBAR_WIDTH;
 /// The panel's narrowest. Wide enough for the segment bar's five labels —
-/// Files, Git, Ports, Automations and AI — at the default text scale, since
-/// nothing in the bar scrolls: a narrower panel would clip the last labels.
+/// Files, Git, Ports, Automations and AI — at the default text scale, so the
+/// bar's own scroll is the fallback for crowded scales rather than the
+/// everyday state.
 pub const PANEL_MIN_WIDTH: f32 = 300.;
 pub const TERMINAL_MIN_WIDTH: f32 = 480.;
 pub const SIDEBAR_MAX_WINDOW_FRACTION: f32 = 1. / 3.;

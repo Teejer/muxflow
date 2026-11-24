@@ -3,7 +3,7 @@ use std::path::Path;
 use serde_json::Value;
 use tmux_agent_protocol::v1;
 
-use super::{AgentAdapter, LaunchSpec, MANAGED_OWNER, MANAGED_VERSION, ParsedHook, fork_name};
+use super::{AgentAdapter, LaunchSpec, MANAGED_OWNER, MANAGED_VERSION, ParsedHook};
 
 /// The ownership marker, first line of every installed file. Ownership is decided
 /// by this line alone: a file at the same path without it belongs to the user.
@@ -63,9 +63,9 @@ impl AgentAdapter for OpenCodeAdapter {
 
     /// The lifecycle names the managed plugin sends. It reports under the names
     /// ingest already understands, so ingest has no OpenCode-specific path; see
-    /// [`Self::parse_hook`]. The raw OpenCode events (session.status, session.idle,
-    /// session.error, session.created, session.deleted, permission.updated,
-    /// permission.replied) are reduced to these inside the plugin.
+    /// [`Self::parse_hook`]. The raw OpenCode events (session.execution.*,
+    /// session.created/deleted, permission.asked/replied, form.created/
+    /// replied/cancelled) are reduced to these inside the plugin.
     fn hook_events(&self) -> &'static [&'static str] {
         &[
             "SessionStart",
@@ -79,7 +79,7 @@ impl AgentAdapter for OpenCodeAdapter {
     }
 
     fn hook_trust_guidance(&self) -> &'static str {
-        "OpenCode runs this plugin with your permissions and does not ask first. It reports only lifecycle state to muxflow; prompts, tool input and tool output never leave OpenCode."
+        "Needs OpenCode 2.x: the plugin uses the version 2 plugin API, which OpenCode 1.x does not load. OpenCode runs this plugin with your permissions and does not ask first. It reports only lifecycle state to muxflow; prompts, tool input and tool output never leave OpenCode."
     }
 
     /// OpenCode is a single native binary whose process title is `opencode`; the
@@ -98,20 +98,18 @@ impl AgentAdapter for OpenCodeAdapter {
         }
     }
 
-    /// `--fork` continues a copy of the conversation under a new session id, the
-    /// same flag `opencode run` exposes; `--title` names the copy so it is
-    /// distinguishable from the original in the session list.
-    fn branch(&self, native_session_id: &str, source_title: &str) -> LaunchSpec {
-        let source_name =
-            crate::service::topology::agent_title_suffix(source_title).unwrap_or(source_title);
+    /// The full TUI's command line has no fork option; `opencode mini --fork`
+    /// continues a copy of the conversation under a new session id in the
+    /// minimal interface. It has no option to name the copy, and `mini` loads
+    /// no TUI plugins, so the copy's state is not reported.
+    fn branch(&self, native_session_id: &str, _source_title: &str) -> LaunchSpec {
         LaunchSpec {
             program: self.executable(),
             arguments: vec![
+                "mini".to_owned(),
                 "--session".to_owned(),
                 native_session_id.to_owned(),
                 "--fork".to_owned(),
-                "--title".to_owned(),
-                fork_name(source_name),
             ],
         }
     }
@@ -195,13 +193,7 @@ mod tests {
         );
         assert_eq!(
             OpenCodeAdapter.branch("ses_1", "✳ Fix tests").arguments,
-            [
-                "--session",
-                "ses_1",
-                "--fork",
-                "--title",
-                "Fix tests (fork)"
-            ]
+            ["mini", "--session", "ses_1", "--fork"]
         );
     }
 

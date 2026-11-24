@@ -1,12 +1,9 @@
-//! The Settings dialog: nine tabs over [`Prefs`](super::Prefs), with the
+//! The Settings dialog: eight tabs over [`Prefs`](super::Prefs), with the
 //! connection form on the first and the shortcuts on Keyboard. Copy, order
 //! and behavior from `features/shell/SettingsDialog.tsx`.
 
 use desktop_core::{
-    app_state::{
-        AgentSoundMode, AppTabViewMode, MarkdownAppearance, NumberKeys, ThemePreference,
-        WindowButtonsSide,
-    },
+    app_state::{AgentSoundMode, AppTabViewMode, MarkdownAppearance, NumberKeys, ThemePreference},
     notifications::{emit_test_notification, notification_permission_status},
 };
 use gpui_kit::{
@@ -104,11 +101,6 @@ const MARKDOWN_APPEARANCES: [(MarkdownAppearance, &str); 3] = [
     (MarkdownAppearance::Default, "Muxflow default"),
     (MarkdownAppearance::Light, "Light"),
     (MarkdownAppearance::Dark, "Dark"),
-];
-
-const WINDOW_BUTTON_SIDES: [(WindowButtonsSide, &str); 2] = [
-    (WindowButtonsSide::Left, "Left, macOS style"),
-    (WindowButtonsSide::Right, "Right, Windows style"),
 ];
 
 const NUMBER_KEYS: [(NumberKeys, &str); 2] = [
@@ -239,7 +231,7 @@ pub fn agent_mode_hint(mode: AgentMode) -> &'static str {
     match mode.chat {
         None => "Connect to this host to choose.",
         Some(true) => {
-            "An agent you start in a terminal opens as a chat in the same tab. Agents already running stay as they are, and pi stays a terminal."
+            "An agent you start in a terminal opens as a chat in the same tab. Agents already running stay as they are, and pi and OpenCode stay terminals."
         }
         Some(false) => {
             "An agent you start in a terminal runs there, as its own terminal interface. Agents already running stay as they are."
@@ -1422,24 +1414,6 @@ impl SettingsDialog {
                 |on, window, cx| update(|prefs| prefs.tabs_in_title_bar = on, window, cx),
                 cx,
             ))
-            .child(
-                v_flex()
-                    .gap(ui(5.))
-                    .child(legend("Window buttons", cx))
-                    .child(radios(
-                        "settings-window-buttons-side",
-                        "Window buttons",
-                        &WINDOW_BUTTON_SIDES,
-                        prefs.window_buttons_side,
-                        |side, window, cx| {
-                            update(|prefs| prefs.window_buttons_side = side, window, cx);
-                        },
-                    ))
-                    .child(hint(
-                        "Which end minimize, maximize and close sit on, and in which order. Only Muxflow's own buttons move: macOS draws its traffic lights itself, and tiling window managers get no buttons at all.",
-                        cx,
-                    )),
-            )
             .child(
                 v_flex()
                     .gap(ui(5.))

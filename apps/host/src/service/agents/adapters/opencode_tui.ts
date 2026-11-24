@@ -12,16 +12,17 @@
 // runs inside the TUI process instead, which lives in a pane and inherits its
 // TMUX_PANE, exactly like the pi extension. The shared server still streams
 // every session's events to every TUI, so this file forwards only the sessions
-// the terminal it runs in is actually showing (its focused session and its open
-// tabs), and it folds subagent sessions onto their root.
+// the terminal it runs in is actually showing (its focused session) or already
+// reported, and it folds subagent sessions onto their root. Open tabs do not
+// count: the server shares one tab list across every terminal.
 //
 // THE TUI EVENT BUS
-// ctx.data.listen delivers every event as {name, details}: `name` is the
-// durable event's type and the payload sits under `details.data`. The bus
-// hands each event to listeners two to five times, so every branch dedups on
-// the event id. A run begins at session.execution.started and ends at
-// session.execution.succeeded; there is no session.status or session.idle on
-// this bus — lifecycle must be read off the execution events.
+// ctx.data.listen delivers every event as {details}: `details.type` is the
+// event's type and the payload sits under `details.data`. The bus hands each
+// event to listeners two to five times, so every handled event dedups on its
+// id. A run begins at session.execution.started and ends at
+// session.execution.succeeded, .failed or .interrupted; lifecycle is read off
+// those execution events.
 import { spawn } from "node:child_process";
 import { Plugin } from "@opencode/plugin/tui";
 
@@ -40,6 +41,21 @@ const SEND_TIMEOUT_MS = 5000;
 // The 32 KiB bound muxflow applies to the final message, applied here first so
 // a huge answer never becomes a huge spawn payload.
 const MESSAGE_CAP = 32 * 1024;
+
+// The bus events this plugin acts on; every other event is ignored unread.
+const HANDLED = new Set([
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.interrupted",
+  "session.execution.failed",
+  "session.created",
+  "session.deleted",
+  "permission.asked",
+  "permission.replied",
+  "form.created",
+  "form.replied",
+  "form.cancelled",
+]);
 
 type Report = { hook_event_name: string; session_id: string; last_assistant_message?: string };
 
@@ -84,7 +100,10 @@ export default Plugin.define({
       if (typeof id !== "string") return true;
       if (seen.has(id)) return false;
       seen.add(id);
-      if (seen.size > 2048) seen.clear();
+      if (seen.size > 2048) {
+        seen.clear();
+        seen.add(id);
+      }
       return true;
     };
 
@@ -99,17 +118,15 @@ export default Plugin.define({
       }
     };
 
-    // The roots this terminal is responsible for: its focused session and the
-    // roots of its open tabs.
+    // The root this terminal is showing: its focused session. The route is per
+    // terminal; the tab list is the server's, shared by every terminal, so it
+    // would claim other panes' sessions.
     const ownedRoots = (): Set<string> => {
       const roots = new Set<string>();
       try {
         const route = ctx.ui?.router?.current?.();
         if (route?.type === "session" && route.sessionID) {
           roots.add(rootOf(route.sessionID));
-        }
-        for (const tab of ctx.ui?.tabs?.list?.() ?? []) {
-          if (tab?.sessionID) roots.add(rootOf(tab.sessionID));
         }
       } catch {
         // A UI query that throws must not stop reporting; fall back to whatever
@@ -124,7 +141,10 @@ export default Plugin.define({
         const messages: readonly any[] = data?.session?.message?.list?.(root) ?? [];
         for (let index = messages.length - 1; index >= 0; index -= 1) {
           const message = messages[index];
-          if (message?.role !== "assistant") continue;
+          // Nothing said since the user's last message: a run interrupted
+          // before any text has no answer, not the previous turn's.
+          if (message?.type === "user") break;
+          if (message?.type !== "assistant") continue;
           const parts = Array.isArray(message.content) ? message.content : [];
           const text = parts
             .filter((part: any) => part?.type === "text" && typeof part.text === "string")
@@ -148,36 +168,89 @@ export default Plugin.define({
       queue = queue.then(() => send(body));
     };
 
-    // Report a lifecycle edge for a root only while this terminal owns it, and
-    // only when it differs from what we last sent for that root.
+    // A root this terminal reports for: the one it shows now, or one whose run
+    // it reported starting and has not seen end, so a run the user navigated
+    // away from still sends its Stop. Once that run ends, a session this
+    // terminal no longer shows is another pane's to report.
+    const IN_PROGRESS = new Set(["UserPromptSubmit", "PermissionRequest", "PostToolUse"]);
+    const reportsFor = (root: string): boolean =>
+      IN_PROGRESS.has(lastSent.get(root) ?? "") || ownedRoots().has(root);
+
+    // Report a lifecycle edge for a root this terminal reports for, and only
+    // when it differs from what we last sent for that root.
     const transition = (hook_event_name: string, rawSessionID: string | undefined, withMessage = false) => {
       if (!rawSessionID) return;
       const root = rootOf(rawSessionID);
-      if (!ownedRoots().has(root)) return;
+      if (!reportsFor(root)) return;
       if (lastSent.get(root) === hook_event_name) return;
       lastSent.set(root, hook_event_name);
       report(hook_event_name, root, withMessage);
     };
 
+    // A permission or question was answered: back to working unless the
+    // session is verifiably idle; a status we cannot read must not park a
+    // running agent.
+    const answered = (sessionID: string | undefined) => {
+      if (!sessionID) return;
+      const root = rootOf(sessionID);
+      if (!reportsFor(root)) return;
+      let idle = false;
+      try {
+        idle = data?.session?.status?.(root) === "idle";
+      } catch {
+        idle = false;
+      }
+      if (idle) {
+        lastSent.set(root, "Stop");
+        report("Stop", root, true);
+      } else {
+        lastSent.set(root, "PostToolUse");
+        report("PostToolUse", root);
+      }
+    };
+
+    // A direct child still running, as OpenCode's own notifier asks: a
+    // background subagent's report wakes its parent again, so the parent's
+    // turn is not over yet.
+    const hasRunningChild = (sessionID: string): boolean => {
+      try {
+        return (data?.session?.family?.(sessionID) ?? []).some(
+          (child: string) =>
+            child !== sessionID &&
+            data.session.get?.(child)?.parentID === sessionID &&
+            data.session.status?.(child) === "running",
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    // The end of a run. A subagent's run ending is not its root's: the root
+    // is still working and ends with its own event.
+    const ended = (hook_event_name: string, sessionID: string | undefined, withMessage: boolean) => {
+      if (!sessionID || rootOf(sessionID) !== sessionID) return;
+      transition(hook_event_name, sessionID, withMessage);
+    };
+
     const off = data?.listen?.((event: any) => {
-      const name = event?.name;
-      if (typeof name !== "string") return;
       const details = event?.details ?? {};
+      const name = details?.type ?? event?.name;
+      if (!HANDLED.has(name) || !once(details?.id)) return;
       const sessionID: string | undefined = details?.data?.sessionID;
 
       if (name === "session.execution.started") {
         // A run is running. The generic working edge ingest understands.
-        if (once(details?.id)) transition("UserPromptSubmit", sessionID);
+        transition("UserPromptSubmit", sessionID);
       } else if (name === "session.execution.succeeded") {
         // The clean end of a successful run; carries the final message.
-        if (once(details?.id)) transition("Stop", sessionID, true);
-      } else if (name === "session.execution.failed" || name === "session.execution.error") {
-        if (once(details?.id)) transition("StopFailure", sessionID);
-      } else if (name === "session.execution.cancelled" || name === "session.execution.aborted") {
-        // An interrupted run is over too; ingest reads Stop as "done".
-        if (once(details?.id)) transition("Stop", sessionID, true);
+        if (sessionID && hasRunningChild(sessionID)) return;
+        ended("Stop", sessionID, true);
+      } else if (name === "session.execution.interrupted") {
+        // Esc, shutdown or a superseding prompt: the run is over.
+        ended("Stop", sessionID, true);
+      } else if (name === "session.execution.failed") {
+        ended("StopFailure", sessionID, false);
       } else if (name === "session.created" || name === "session.deleted") {
-        if (!once(details?.id)) return;
         // A child session starting or ending is not a new pane agent.
         if (details?.data?.parentID) return;
         if (!sessionID) return;
@@ -187,32 +260,20 @@ export default Plugin.define({
           lastSent.set(root, "SessionStart");
           report("SessionStart", root);
         } else {
+          // Every terminal hears every session's deletion; only the one that
+          // reported this session ends it.
+          if (!lastSent.has(root)) return;
           lastSent.delete(root);
           report("SessionEnd", root);
         }
-      } else if (name === "permission.asked" || name === "permission.updated") {
+      } else if (name === "permission.asked") {
         // A permission request waits on the human.
-        if (once(details?.id)) transition("PermissionRequest", sessionID);
-      } else if (name === "permission.replied" || name === "permission.deleted") {
-        if (!once(details?.id)) return;
-        if (!sessionID) return;
-        const root = rootOf(sessionID);
-        if (!ownedRoots().has(root)) return;
-        // Back to working unless the session is verifiably idle; a status API
-        // we cannot read must not park a running agent.
-        let status = "running";
-        try {
-          status = String(data?.session?.status?.(root) ?? "running");
-        } catch {
-          status = "running";
-        }
-        if (status === "idle") {
-          lastSent.set(root, "Stop");
-          report("Stop", root, true);
-        } else {
-          lastSent.set(root, "PostToolUse");
-          report("PostToolUse", root);
-        }
+        transition("PermissionRequest", sessionID);
+      } else if (name === "form.created") {
+        // A question the agent asks waits on the human too.
+        transition("PermissionRequest", details?.data?.form?.sessionID);
+      } else if (name === "permission.replied" || name === "form.replied" || name === "form.cancelled") {
+        answered(sessionID);
       }
     });
 
