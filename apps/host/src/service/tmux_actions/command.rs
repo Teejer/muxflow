@@ -16,7 +16,9 @@ pub(in crate::service) const APP_SHELL: [&str; 3] =
 /// directory is resolved and checked *on the host that owns the filesystem*,
 /// before `new-session` is spawned, so a path that is missing, relative, or not
 /// a directory refuses the create outright instead of leaving a workspace
-/// sitting in the wrong place.
+/// sitting in the wrong place. One that is simply not named gets the host's
+/// home: tmux's own fallback is the server's working directory, and a server
+/// started by a GUI-launched app sits at `/`.
 ///
 /// The name is the session's and only the session's. The first window is left
 /// to tmux, which names it after the command running in it and keeps renaming
@@ -45,7 +47,21 @@ pub(in crate::service) fn configure_new_session(
         "-F",
         "#{session_id} #{window_id} #{pane_id}",
     ]);
-    if !action.directory.is_empty() {
+    if action.directory.is_empty() {
+        // No directory named: start at the host's home when it can be stood
+        // behind. Omitting `-c` left the first pane at the *server's* cwd, and
+        // the server inherits the cwd of whatever started it — `/` whenever
+        // Muxflow's own daemon starts it, which is every local session on
+        // macOS because a GUI-launched process always begins there. Home is
+        // where a plain terminal or a plain ssh login would have landed the
+        // user. A host whose home is missing or unusable keeps tmux's old
+        // default rather than refusing the create: the fallback is a
+        // convenience, not a promise the create stands behind.
+        if let Ok(home) = resolved_start_directory("~") {
+            command.arg("-c");
+            command.arg(escaped_format_literal(&home));
+        }
+    } else {
         command.arg("-c");
         command.arg(escaped_format_literal(&resolved_start_directory(
             &action.directory,
@@ -688,7 +704,9 @@ mod tests {
     /// rename the window a second later would take the name anyway.
     #[test]
     fn new_session_names_the_session_and_leaves_its_window_to_tmux() {
+        let directory = std::env::temp_dir();
         let action = v1::TmuxAction {
+            directory: directory.to_string_lossy().into_owned(),
             name: "checkout".into(),
             ..Default::default()
         };
@@ -700,6 +718,8 @@ mod tests {
                 "-P",
                 "-F",
                 "#{session_id} #{window_id} #{pane_id}",
+                "-c",
+                directory.to_string_lossy().as_ref(),
                 "-s",
                 "checkout",
                 APP_SHELL[0],
@@ -800,15 +820,29 @@ mod tests {
         assert!(args.contains(&"tab ##(id)".to_owned()), "{args:?}");
     }
 
+    /// A create that names no directory used to omit `-c`, leaving tmux to
+    /// start the first pane at the *server's* cwd. The daemon — and the server
+    /// it spawns — starts at `/` on a GUI launch, so every local macOS
+    /// workspace opened at the root of the filesystem and dragged every tab
+    /// inherited beside it there. Home is right on every host, GUI or SSH.
+    ///
+    /// Read from the live environment rather than by setting `HOME`, for the
+    /// same reason the `~` expansion test does: mutating the process
+    /// environment from one test races every other test in the binary.
     #[test]
-    fn new_session_without_a_configured_directory_leaves_tmuxs_own_choice_alone() {
+    fn new_session_without_a_configured_directory_starts_at_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        if !std::path::Path::new(&home).is_dir() {
+            return;
+        }
         let args = session_args(&v1::TmuxAction::default()).unwrap();
-        assert!(
-            !args[..args.len() - APP_SHELL.len()]
-                .iter()
-                .any(|argument| argument == "-c"),
-            "{args:?}"
-        );
+        let index = args
+            .iter()
+            .position(|argument| argument == "-c")
+            .expect("a create with no directory must still name a start directory");
+        assert_eq!(args[index + 1], home.to_string_lossy());
     }
 
     /// `~` is the shape people type, and tmux does not expand it: without this
