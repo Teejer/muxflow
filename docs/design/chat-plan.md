@@ -203,15 +203,21 @@ What differs from the plan above:
   runs, `chat-pipe` turns off echo and the signal keys on the pane's terminal,
   and throws away what was typed when the agent ends, so the shell that follows
   runs none of it.
+- **Leaving a chat.** Ctrl+C in a chat stops the agent while it works, as Stop
+  does, and a second Ctrl+C within 2 s sends `CHAT_ACTION_END`; text selected
+  in the composer is copied instead. The host sends `SIGTERM` to the pane's
+  `chat-pipe`, which asks the agent to stop and kills it 3 s later, and once
+  the pipe has gone it untags the pane: the shell that follows is the
+  terminal the desktop draws in its place.
 - **The environment** is written to a file only the owner can read, in the
   runtime directory, and `chat-pipe` deletes it as it reads it. A chat that
   never starts has its file removed when the daemon gives up on it or sweeps
   the directory.
 - **Trigger.** Claude converts on its hook when the hook is installed, with or
-  without a client connected. Codex converts on process detection, which runs
-  only while a client is subscribed: `codex` started with no desktop or phone
-  connected stays a terminal. A `SessionStart` older than 10 s starts no chat:
-  one that waited in the mailbox of a daemon that was down is about a session
+  without a client connected. Codex, and Claude without its hook, convert on
+  process detection, which the daemon's 2 s maintenance pass runs in Chat mode
+  whether or not a client is connected, so an automation's `codex` becomes a
+  chat too. A `SessionStart` older than 10 s starts no chat: one that waited in the mailbox of a daemon that was down is about a session
   somebody may already be typing into. The hook names a pane and not a
   process, so the agent found in the pane must itself be under 20 s old: a
   session that resumes another from inside, or starts an agent of its own
